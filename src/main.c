@@ -32,6 +32,9 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <utime.h>
+#include <sys/ioctl.h>
+#include <sys/capability.h>
+#include <linux/fs.h>
 
 #ifndef WITHOUT_XATTR
 #include <attr/xattr.h>
@@ -447,6 +450,82 @@ static int mhdd_write(const char *path, const char *buf, size_t count,
 	errno = ENOSPC;
 	flist_unlock();
 	return -errno;
+}
+
+static int 
+mhdd_ioctl(const char* path, int cmd, void* arg, struct fuse_file_info* fi, unsigned int flags, void* data)
+ {
+   int rv;
+   struct flist *info;
+   
+   mhdd_debug(MHDD_INFO, "mhdd_ioctl: %s, cmd = %i, arg = %p\n", path, cmd, arg);
+   
+   info = flist_item_by_id(fi->fh);
+   if(!info) 
+     {
+       errno = EBADF;
+       return -errno;
+     }	
+
+   switch(cmd)
+     {
+     case FS_IOC_GETFLAGS:
+       rv = ioctl(info->fh,FS_IOC_GETFLAGS,data);
+       if(rv == -1)
+	 rv = -errno;
+       break;
+
+     case FS_IOC_SETFLAGS:
+       {
+	 int fhflags;
+         cap_t caps;
+         cap_flag_value_t value;
+	 struct fuse_context* fc;
+
+	 rv = ioctl(info->fh,FS_IOC_GETFLAGS,&fhflags);
+	 if(rv == -1)
+	   {
+	     rv = -errno;
+	   }
+	 else
+	   {
+	     fc = fuse_get_context();
+	     if(fc->uid != 0 &&
+		((*(int*)data ^ fhflags) & FS_IMMUTABLE_FL))
+	       {
+		 caps = cap_get_pid(fc->pid);
+		 cap_get_flag(caps,CAP_LINUX_IMMUTABLE,CAP_EFFECTIVE,&value);
+		 
+		 if(value == CAP_SET)
+		   {
+		     rv = ioctl(info->fh,FS_IOC_SETFLAGS,data);
+		     if(rv == -1)
+		       rv = -errno;
+		   }
+		 else
+		   {
+		     rv = -EPERM;
+		   }
+	       }
+	     else
+	       {
+		 rv = ioctl(info->fh,FS_IOC_SETFLAGS,data);
+		 if(rv == -1)
+		   rv = -errno;
+	       }
+	   }
+      }
+      break;
+      
+    default:
+      errno = ENOTTY;
+      rv = -errno;
+      break;
+    }
+  
+  flist_unlock();
+  
+  return rv;	
 }
 
 // truncate
@@ -1029,6 +1108,7 @@ static struct fuse_operations mhdd_oper = {
 	.mknod      	= mhdd_mknod,
 	.fsync      	= mhdd_fsync,
 	.link		= mhdd_link,
+        .ioctl          = mhdd_ioctl,
 #ifndef WITHOUT_XATTR
         .setxattr   	= mhdd_setxattr,
         .getxattr   	= mhdd_getxattr,

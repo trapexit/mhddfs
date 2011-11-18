@@ -28,7 +28,7 @@ ifdef WITHOUT_XATTR
 CFLAGS	+=	-DWITHOUT_XATTR
 endif
 
-LDFLAGS	=	$(shell pkg-config fuse --libs)
+LDFLAGS	=	$(shell pkg-config fuse --libs) -lcap
 
 FORTAR	=	src COPYING LICENSE README Makefile \
 		README.ru.UTF-8 ChangeLog mhddfs.1 \
@@ -99,7 +99,7 @@ clean:
 
 rename: tests/rename.c
 	gcc -o $@ $<
-	
+
 release_svn_thread:
 	@echo current version $(VERSION)
 	if ! svn ls http://svn.uvw.ru/mhddfs/tags| \
@@ -154,7 +154,6 @@ btest:
 			|tee $$file_name \
 			|md5sum; \
 		md5sum $$file_name
-		
 
 tests:
 	while make test; do echo ok; echo; done
