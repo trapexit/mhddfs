@@ -1,0 +1,53 @@
+K 25
+svn:wc:ra_dav:version-url
+V 26
+/!svn/ver/681/mhddfs/trunk
+END
+LICENSE
+K 25
+svn:wc:ra_dav:version-url
+V 32
+/!svn/ver/3/mhddfs/trunk/LICENSE
+END
+README.ru.UTF-8
+K 25
+svn:wc:ra_dav:version-url
+V 42
+/!svn/ver/680/mhddfs/trunk/README.ru.UTF-8
+END
+mhddfs.1
+K 25
+svn:wc:ra_dav:version-url
+V 35
+/!svn/ver/418/mhddfs/trunk/mhddfs.1
+END
+ChangeLog
+K 25
+svn:wc:ra_dav:version-url
+V 36
+/!svn/ver/630/mhddfs/trunk/ChangeLog
+END
+COPYING
+K 25
+svn:wc:ra_dav:version-url
+V 32
+/!svn/ver/3/mhddfs/trunk/COPYING
+END
+Makefile
+K 25
+svn:wc:ra_dav:version-url
+V 35
+/!svn/ver/651/mhddfs/trunk/Makefile
+END
+README
+K 25
+svn:wc:ra_dav:version-url
+V 33
+/!svn/ver/680/mhddfs/trunk/README
+END
+mhddfs.spec
+K 25
+svn:wc:ra_dav:version-url
+V 38
+/!svn/ver/560/mhddfs/trunk/mhddfs.spec
+END
