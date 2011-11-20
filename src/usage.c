@@ -43,7 +43,8 @@ void usage(FILE * to)
 		"\n"
 		" see fusermount(1) for information about other options\n"
 		"";
-	fprintf(to, usage);
-	if (to==stdout) exit(0);
+	fprintf(to, "%s", usage);
+	if (to==stdout) 
+	  exit(0);
 	exit(-1);
 }

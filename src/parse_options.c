@@ -48,8 +48,8 @@ struct mhdd_config mhdd={0};
 
 /* the number less (or equal) than 100 is in percent,
    more than 100 is in bytes */
-#define DEFAULT_MLIMIT ( 4l * 1024 * 1024 * 1024 )
-#define MINIMUM_MLIMIT ( 50l * 1024 * 1024 )
+#define DEFAULT_MLIMIT ( 4UL * 1024 * 1024 * 1024 )
+#define MINIMUM_MLIMIT ( 50UL * 1024 * 1024 )
 
 static struct fuse_opt mhddfs_opts[]={
 	MHDDFS_OPT("mlimit=%s",   mlimit_str, 0),
@@ -292,7 +292,7 @@ struct fuse_args * parse_options(int argc, char *argv[])
 
 		if (mhdd.move_limit < MINIMUM_MLIMIT) {
 			if (!mhdd.move_limit) {
-				mhdd.move_limit = DEFAULT_MLIMIT;
+			  mhdd.move_limit = DEFAULT_MLIMIT;
 			} else {
 				if (mhdd.move_limit > 100)
 					mhdd.move_limit = MINIMUM_MLIMIT;
