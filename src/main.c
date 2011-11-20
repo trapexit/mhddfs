@@ -20,6 +20,7 @@
  */
 #define _XOPEN_SOURCE 500
 #define _BSD_SOURCE 1
+#define _GNU_SOURCE 1
 #include <fuse.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -573,7 +574,24 @@ static int mhdd_access(const char *path, int mask)
 	mhdd_debug(MHDD_MSG, "mhdd_access: %s mode = %04X\n", path, mask);
 	char *file = find_path(path);
 	if (file) {
-		int res = access(file, mask);
+                int res;
+	        uid_t uid;
+		gid_t gid;
+		struct fuse_context* fc;
+
+		fc = fuse_get_context();
+
+		uid = getuid();
+		gid = getgid();
+
+		setegid(fc->gid);
+		seteuid(fc->uid);
+
+		res = eaccess(file, mask);
+
+		seteuid(uid);
+		seteuid(gid);
+
 		free(file);
 		if (res == -1)
 			return -errno;
