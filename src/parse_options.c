@@ -49,14 +49,14 @@ struct mhdd_config mhdd={0};
 
 /* the number less (or equal) than 100 is in percent,
    more than 100 is in bytes */
-#define DEFAULT_MLIMIT ( 4UL * 1024 * 1024 * 1024 )
-#define MINIMUM_MLIMIT ( 50UL * 1024 * 1024 )
+#define DEFAULT_MOVE_LIMIT ( 4UL * 1024 * 1024 * 1024 )
+#define MINIMUM_MOVE_LIMIT ( 50UL * 1024 * 1024 )
 
 static struct fuse_opt mhddfs_opts[]=
   {
-    MHDDFS_OPT("mlimit=%s",   mlimit_str, 0),
+    MHDDFS_OPT("mlimit=%s",   move_limit_str, 0),
     MHDDFS_OPT("logfile=%s",  debug_file, 0),
-    MHDDFS_OPT("loglevel=%d", loglevel,   0),
+    MHDDFS_OPT("loglevel=%d", log_level, 0),
     
     FUSE_OPT_KEY("-V",        MHDD_VERSION_OPT),
     FUSE_OPT_KEY("--version", MHDD_VERSION_OPT),
@@ -87,9 +87,9 @@ add_mhdd_dir(const char *dir)
   if(new_dir[len] == '/')
     new_dir[len] = '\0';
   
-  mhdd.dirs = realloc(mhdd.dirs,(sizeof(char*)*(mhdd.cdirs+1)));
-  mhdd.dirs[mhdd.cdirs] = new_dir;
-  mhdd.cdirs++;
+  mhdd.dirs = realloc(mhdd.dirs,(sizeof(char*)*(mhdd.dir_count+1)));
+  mhdd.dirs[mhdd.dir_count] = new_dir;
+  mhdd.dir_count++;
 }
 
 static int
@@ -108,11 +108,11 @@ mhddfs_opt_proc(void *data, const char *arg,
         char *dir = strdup(arg);
         for(tmp=dir; tmp; tmp=strchr(tmp+1, ','))
           {
-            if (*tmp==',')
+            if(*tmp==',')
               tmp++;
             char *add = strdup(tmp);
             char *end = strchr(add, ',');
-            if (end)
+            if(end)
               *end = 0;
             add_mhdd_dir(add);
             free(add);
@@ -129,25 +129,25 @@ static void
 check_if_unique_mountpoints(void)
 {
   int i, j;
-  struct stat * stats = calloc(mhdd.cdirs, sizeof(struct stat));
+  struct stat * stats = calloc(mhdd.dir_count, sizeof(struct stat));
 
-  for (i = 0; i < mhdd.cdirs; i++)
+  for(i = 0; i < mhdd.dir_count; i++)
     {
-      if (stat(mhdd.dirs[i], stats + i) != 0)
+      if(stat(mhdd.dirs[i], stats + i) != 0)
         memset(stats + i, 0, sizeof(struct stat));
 
-      for (j = 0; j < i; j++)
+      for(j = 0; j < i; j++)
         {
-          if (strcmp(mhdd.dirs[i], mhdd.dirs[j]) != 0)
+          if(strcmp(mhdd.dirs[i], mhdd.dirs[j]) != 0)
             {
               /*  mountdir isn't unique */
-              if (stats[j].st_dev != stats[i].st_dev)
+              if(stats[j].st_dev != stats[i].st_dev)
                 continue;
-              if (stats[j].st_ino != stats[i].st_ino)
+              if(stats[j].st_ino != stats[i].st_ino)
                 continue;
-              if (!stats[i].st_dev)
+              if(!stats[i].st_dev)
                 continue;
-              if (!stats[i].st_ino)
+              if(!stats[i].st_ino)
                 continue;
             }
           
@@ -162,9 +162,9 @@ check_if_unique_mountpoints(void)
           free(mhdd.dirs[i]);
           mhdd.dirs[i] = 0;
           
-          for (j = i; j < mhdd.cdirs - 1; j++)
+          for(j = i; j < mhdd.dir_count - 1; j++)
             mhdd.dirs[j] = mhdd.dirs[j+1];
-          mhdd.cdirs--;
+          mhdd.dir_count--;
           i--;
           break;
         }
@@ -173,7 +173,8 @@ check_if_unique_mountpoints(void)
   free(stats);
 }
 
-struct fuse_args * parse_options(int argc, char *argv[])
+struct fuse_args *
+parse_options(int argc, char *argv[])
 {
   struct fuse_args * args=calloc(1, sizeof(struct fuse_args));
   char * info;
@@ -184,25 +185,25 @@ struct fuse_args * parse_options(int argc, char *argv[])
     memcpy(args, &tmp, sizeof(struct fuse_args));
   }
 
-  mhdd.loglevel=MHDD_DEFAULT_DEBUG_LEVEL;
+  mhdd.log_level=MHDD_DEFAULT_DEBUG_LEVEL;
   if(fuse_opt_parse(args, &mhdd, mhddfs_opts, mhddfs_opt_proc)==-1)
     usage(stderr);
 
-  if(mhdd.cdirs < 3)
+  if(mhdd.dir_count < 3)
     usage(stderr);
-  mhdd.mount=mhdd.dirs[--mhdd.cdirs];
-  mhdd.dirs[mhdd.cdirs]=0;
+  mhdd.mount=mhdd.dirs[--mhdd.dir_count];
+  mhdd.dirs[mhdd.dir_count]=0;
 
   check_if_unique_mountpoints();
 
-  for(i=l=0; i < mhdd.cdirs; i++)
+  for(i=l=0; i < mhdd.dir_count; i++)
     l += strlen(mhdd.dirs[i])+2;
   l += sizeof(FUSE_MP_OPT_STR);
   info = calloc(l, sizeof(char));
   strcat(info, FUSE_MP_OPT_STR);
-  for (i=0; i<mhdd.cdirs; i++)
+  for(i=0; i<mhdd.dir_count; i++)
     {
-      if (i)
+      if(i)
         strcat(info, ";");
       strcat(info, mhdd.dirs[i]);
     }
@@ -210,20 +211,20 @@ struct fuse_args * parse_options(int argc, char *argv[])
   fuse_opt_insert_arg(args, 1, mhdd.mount);
   free(info);
 
-  if (mhdd.cdirs)
+  if(mhdd.dir_count)
     {
       int i;
-      for(i=0; i<mhdd.cdirs; i++)
+      for(i=0; i<mhdd.dir_count; i++)
         {
           struct stat info;
-          if (stat(mhdd.dirs[i], &info))
+          if(stat(mhdd.dirs[i], &info))
             {
               fprintf(stderr,
                       "mhddfs: can not stat '%s': %s\n",
                       mhdd.dirs[i], strerror(errno));
               exit(-1);
             }
-          if (!S_ISDIR(info.st_mode))
+          if(!S_ISDIR(info.st_mode))
             {
               fprintf(stderr,
                       "mhddfs: '%s' - is not directory\n\n",
@@ -239,12 +240,12 @@ struct fuse_args * parse_options(int argc, char *argv[])
 
   fprintf(stderr, "mhddfs: mount to: %s\n", mhdd.mount);
 
-  if (mhdd.debug_file)
+  if(mhdd.debug_file)
     {
-      fprintf(stderr, "mhddfs: using debug file: %s, loglevel=%d\n",
-              mhdd.debug_file, mhdd.loglevel);
+      fprintf(stderr, "mhddfs: using debug file: %s, log_level=%d\n",
+              mhdd.debug_file, mhdd.log_level);
       mhdd.debug=fopen(mhdd.debug_file, "a");
-      if (!mhdd.debug)
+      if(!mhdd.debug)
         {
           fprintf(stderr, "Can not open file '%s': %s",
                   mhdd.debug_file,
@@ -254,57 +255,60 @@ struct fuse_args * parse_options(int argc, char *argv[])
       setvbuf(mhdd.debug, NULL, _IONBF, 0);
     }
 
-  mhdd.move_limit = DEFAULT_MLIMIT;
+  mhdd.move_limit = DEFAULT_MOVE_LIMIT;
 
-  if (mhdd.mlimit_str)
+  if(mhdd.move_limit_str)
     {
-      int len = strlen(mhdd.mlimit_str);
+      int len = strlen(mhdd.move_limit_str);
 
-      if (len) {
-        switch(mhdd.mlimit_str[len-1])
+      if(len) {
+        switch(mhdd.move_limit_str[len-1])
           {
           case 'm':
           case 'M':
-            mhdd.mlimit_str[len-1]=0;
-            mhdd.move_limit=atoll(mhdd.mlimit_str);
+            mhdd.move_limit_str[len-1]=0;
+            mhdd.move_limit=atoll(mhdd.move_limit_str);
             mhdd.move_limit*=1024*1024;
             break;
           case 'g':
           case 'G':
-            mhdd.mlimit_str[len-1]=0;
-            mhdd.move_limit=atoll(mhdd.mlimit_str);
+            mhdd.move_limit_str[len-1]=0;
+            mhdd.move_limit=atoll(mhdd.move_limit_str);
             mhdd.move_limit*=1024*1024*1024;
             break;
 
           case 'k':
           case 'K':
-            mhdd.mlimit_str[len-1]=0;
-            mhdd.move_limit=atoll(mhdd.mlimit_str);
+            mhdd.move_limit_str[len-1]=0;
+            mhdd.move_limit=atoll(mhdd.move_limit_str);
             mhdd.move_limit*=1024;
             break;
 
           case '%':
-            mhdd.mlimit_str[len-1]=0;
-            mhdd.move_limit=atoll(mhdd.mlimit_str);
+            mhdd.move_limit_str[len-1]=0;
+            mhdd.move_limit=atoll(mhdd.move_limit_str);
             break;
 
           default:
-            mhdd.move_limit=atoll(mhdd.mlimit_str);
+            mhdd.move_limit=atoll(mhdd.move_limit_str);
             break;
           }
       }
 
-      if (mhdd.move_limit < MINIMUM_MLIMIT) {
-        if (!mhdd.move_limit) {
-          mhdd.move_limit = DEFAULT_MLIMIT;
-        } else {
-          if (mhdd.move_limit > 100)
-            mhdd.move_limit = MINIMUM_MLIMIT;
+      if(mhdd.move_limit < MINIMUM_MOVE_LIMIT)
+        {
+          if(!mhdd.move_limit)
+            {
+              mhdd.move_limit = DEFAULT_MOVE_LIMIT;
+            }
+          else if(mhdd.move_limit > 100)
+            {
+              mhdd.move_limit = MINIMUM_MOVE_LIMIT;
+            }
         }
-      }
     }
 
-  if (mhdd.move_limit <= 100)
+  if(mhdd.move_limit <= 100)
     fprintf(stderr, "mhddfs: move size limit %lld%%\n",
             (long long)mhdd.move_limit);
   else

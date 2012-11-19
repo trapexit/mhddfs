@@ -27,22 +27,19 @@
 #include "flist.h"
 
 int    get_free_dir(void);
-void   create_path(const char *dir, const char * file, char path[PATH_MAX]);
+void   create_path(const char *dir, const char *file, char path[PATH_MAX]);
+void   create_tmppath(const char *dir, const char *file, char path[PATH_MAX]);
 char * find_fullpath(const char *file, char path[PATH_MAX]);
 int    find_fullpath_id(const char *file);
 
 int create_parent_dirs(int dir_id, const char *path);
 int copy_xattrs(const char *from, const char *to);
 
-
 // true if success
 int move_file(struct flist * file, off_t size);
 
-
 // paths
 char * get_parent_path(const char *path);
-char * get_base_name(const char *path);
-
 
 // others
 int dir_is_empty(const char *path);
