@@ -41,7 +41,7 @@
 #include "parse_options.h"
 
 
-// get diridx for maximum free space
+// get dir idx for maximum free space
 int
 get_free_dir(void)
 {
@@ -103,7 +103,8 @@ get_free_dir(void)
 
 // find mount point with free space > size
 // -1 if not found
-static int find_free_space(off_t size)
+static int
+find_free_space(off_t size)
 {
   int i, max;
   struct statvfs stf;
@@ -111,11 +112,14 @@ static int find_free_space(off_t size)
 
   for (max=-1,i=0; i<mhdd.dir_count; i++)
     {
-      if(statvfs(mhdd.dirs[i], &stf)!=0) continue;
+      if(statvfs(mhdd.dirs[i], &stf)!=0)
+        continue;
+
       fsblkcnt_t space  = stf.f_bsize;
       space *= stf.f_bavail;
 
-      if(space>size+mhdd.move_limit) return i;
+      if(space>size+mhdd.move_limit)
+        return i;
 
       if(space>size && (max<0 || max_space<space))
         {

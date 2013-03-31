@@ -377,20 +377,22 @@ static int mhdd_fileopen(const char *file, struct fuse_file_info *fi)
 }
 
 // close
-static int mhdd_release(const char *path, struct fuse_file_info *fi)
+static int
+mhdd_release(const char *path, struct fuse_file_info *fi)
 {
   struct flist *del;
   int fh;
 
   mhdd_debug(MHDD_MSG, "mhdd_release: %s, handle = %lld\n", path, fi->fh);
   del = flist_item_by_id_wrlock(fi->fh);
-  if(!del) {
-    mhdd_debug(MHDD_INFO,
-               "mhdd_release: unknown file number: %llu\n", fi->fh);
-    errno = EBADF;
-    return -errno;
-  }
-
+  if(!del)
+    {
+      mhdd_debug(MHDD_INFO,
+                 "mhdd_release: unknown file number: %llu\n", fi->fh);
+      errno = EBADF;
+      return -errno;
+    }
+  
   fh = del->fh;
   flist_delete_wrlocked(del);
   close(fh);
@@ -433,42 +435,48 @@ mhdd_write(const char *path, const char *buf, size_t count,
   mhdd_debug(MHDD_INFO, "mhdd_write: %s, handle = %lld\n", path, fi->fh);
 
   info = flist_item_by_id(fi->fh);
-
-  if(!info) {
-    errno = EBADF;
-    return -errno;
-  }
-
-  res = pwrite(info->fh, buf, count, offset);
-  if((res == count) || (res == -1 && errno != ENOSPC)) {
-    flist_unlock();
-    if(res == -1) {
-      mhdd_debug(MHDD_DEBUG,
-                 "mhdd_write: error write %s: %s\n",
-                 info->real_name, strerror(errno));
+  if(!info)
+    {
+      errno = EBADF;
       return -errno;
     }
-    return res;
-  }
+  
+  res = pwrite(info->fh, buf, count, offset);
+  if((res == count) || (res == -1 && errno != ENOSPC))
+    {
+      flist_unlock();
+      if(res == -1)
+        {
+          mhdd_debug(MHDD_DEBUG,
+                     "mhdd_write: error write %s: %s\n",
+                     info->real_name, strerror(errno));
+          return -errno;
+        }
+      return res;
+    }
 
   // end free space
-  if(move_file(info, offset + count) == 0) {
-    res = pwrite(info->fh, buf, count, offset);
-    flist_unlock();
-    if(res == -1) {
-      mhdd_debug(MHDD_DEBUG,
-                 "mhdd_write: error restart write: %s\n",
-                 strerror(errno));
-      return -errno;
+  if(move_file(info, offset + count) == 0)
+    {
+      res = pwrite(info->fh, buf, count, offset);
+      flist_unlock();
+      if(res == -1)
+        {
+          mhdd_debug(MHDD_DEBUG,
+                     "mhdd_write: error restart write: %s\n",
+                     strerror(errno));
+          return -errno;
+        }
+      if(res < count)
+        {
+          mhdd_debug(MHDD_DEBUG,
+                     "mhdd_write: error (re)write file %s %s\n",
+                     info->real_name,
+                     strerror(ENOSPC));
+        }
+      return res;
     }
-    if(res < count) {
-      mhdd_debug(MHDD_DEBUG,
-                 "mhdd_write: error (re)write file %s %s\n",
-                 info->real_name,
-                 strerror(ENOSPC));
-    }
-    return res;
-  }
+
   errno = ENOSPC;
   flist_unlock();
   return -errno;
