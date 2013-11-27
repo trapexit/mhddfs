@@ -24,26 +24,93 @@
 #include <stdint.h>
 #include <pthread.h>
 
-#include "flist.h"
-
-int    get_free_dir(void);
-void   create_path(const char *dir, const char *file, char path[PATH_MAX]);
-void   create_tmppath(const char *dir, const char *file, char path[PATH_MAX]);
-char * find_fullpath(const char *file, char path[PATH_MAX]);
-int    find_fullpath_id(const char *file);
-
-int create_parent_dirs(int dir_id, const char *path);
-int copy_xattrs(const char *from, const char *to);
-
-// true if success
-int move_file(struct flist * file, off_t size);
-
-// paths
-char * get_parent_path(const char *path);
-
-// others
-int dir_is_empty(const char *path);
-
 #define MOVE_BLOCK_SIZE     32768
+
+#define strlendupa(s,n)                                                 \
+  (__extension__                                                        \
+   ({                                                                   \
+     const char *__old = (s);                                           \
+     *(n) = strlen (__old) + 1;                                         \
+     char *__new = (char *) __builtin_alloca (__len);                   \
+     (char *) memcpy(__new, __old, __len);                              \
+   }))
+
+typedef struct fileinfo_t
+{
+  int   fd;
+  int   flags;
+  char *real_path;
+} fileinfo_t;
+
+int
+get_free_dir(void);
+
+int
+create_real_path(const char *dir,
+                 const char *file,
+                 char       *real_path,
+                 const int   maxlen);
+
+int
+create_real_tmppath(const char *dir,
+                    const char *file,
+                    char       *real_path,
+                    const int   maxlen);
+
+char*
+find_real_path(const char *fuse_path,
+               char       *real_path,
+               const int   maxlen);
+
+int
+find_real_path_id(const char *fuse_path);
+
+int
+create_parent_dirs(int dir_id,
+                   const char *path);
+
+int
+copy_xattrs(const char *from,
+            const char *to);
+
+int
+move_file(const char *fuse_path,
+          fileinfo_t *fileinfo,
+          off_t       size);
+
+char*
+dirname(char const * const  path,
+        char               *parent,
+        size_t              maxlen);
+
+int
+dir_is_empty(const char *path);
+
+void
+normalize_statvfs(struct statvfs      *stat,
+                  const unsigned long  min_bsize,
+                  const unsigned long  min_frsize,
+                  const unsigned long  namemax);
+
+void
+merge_statvfs(struct statvfs       * const out,
+              const struct statvfs * const in);
+
+int
+myfallocate(int   fd,
+            int   mode,
+            off_t offset,
+            off_t len);
+
+int
+has_cap_linux_immutable(const pid_t pid);
+
+int
+ioctl_setflags(const int    fd,
+               const pid_t  pid,
+               void        *data);
+
+void
+mhdd_asserts();
 
 #endif

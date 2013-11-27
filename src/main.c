@@ -19,9 +19,11 @@
   (added support for extended attributes.)
 */
 
-#define _XOPEN_SOURCE 500
-#define _BSD_SOURCE 1
-#define _GNU_SOURCE 1
+#define _XOPEN_SOURCE   600
+#define _POSIX_C_SOURCE 200112L
+#define _BSD_SOURCE
+#define _GNU_SOURCE
+
 #include <fuse.h>
 #include <stdio.h>
 #include <unistd.h>
@@ -35,9 +37,7 @@
 #include <sys/time.h>
 #include <utime.h>
 #include <sys/ioctl.h>
-#include <sys/capability.h>
 #include <linux/fs.h>
-#include <limits.h>
 #include <alloca.h>
 
 #ifndef WITHOUT_XATTR
@@ -49,283 +49,226 @@
 
 #include "debug.h"
 
-#include <uthash.h>
+#include "khash.h"
+
+KHASH_SET_INIT_STR(str)
 
 // getattr
 static int
-mhdd_stat(const char *file_name, struct stat *buf)
+mhdd_stat(const char  *fuse_path,
+          struct stat *buf)
 {
-  char path[PATH_MAX];
+  int rv;
+  char real_path[PATH_MAX];
 
-  mhdd_debug(MHDD_MSG, "mhdd_stat: %s\n", file_name);
+  if(find_real_path(fuse_path,real_path,PATH_MAX) == NULL)
+    return -ENOENT;
 
-  if(find_fullpath(file_name,path) != NULL)
-    {
-      if(lstat(path,buf) == -1)
-        return -errno;
-      return 0;
-    }
+  mhdd_debug(MHDD_MSG,
+             "mhdd_stat: fuse_path: %s; real_path: %s\n",
+             fuse_path, real_path);
 
-  errno = ENOENT;
-  return -errno;
+  rv = lstat(real_path,buf);
+  if(rv == -1)
+    return -errno;
+
+  return rv;
 }
 
 //statvfs
 static int
-mhdd_statfs(const char *path, struct statvfs *buf)
+mhdd_statfs(const char     *fuse_path,
+            struct statvfs *stat)
 {
-  int i, j;
-  struct statvfs *stats;
-  struct stat st;
-  dev_t *devices;
-  unsigned long min_block = ULONG_MAX;
-  unsigned long min_frame = ULONG_MAX;
+  int i;
+  int rv;
+  struct statvfs devstats;
+  struct statvfs tmpstats;
 
-  mhdd_debug(MHDD_MSG, "mhdd_statfs: %s\n", path);
+  mhdd_debug(MHDD_MSG,
+             "mhdd_statfs: fuse_path: %s\n",
+             fuse_path);
 
-  stats = alloca(mhdd.dir_count * sizeof(struct statvfs));
-  devices = alloca(mhdd.dir_count * sizeof(dev_t));
+  rv = fstatvfs(mhdd.device_fds[0],&devstats);
+  if(rv != 0)
+    return -errno;
 
-  for(i = 0; i < mhdd.dir_count; i++)
+  normalize_statvfs(&devstats,mhdd.min_bsize,mhdd.min_frsize,mhdd.namemax);
+
+  for(i = 1; i < mhdd.device_count; i++)
     {
-      int ret;
-
-      ret = stat(mhdd.dirs[i], &st);
-      if(ret != 0)
+      rv = fstatvfs(mhdd.device_fds[i],&tmpstats);
+      if(rv != 0)
         return -errno;
-      
-      ret = statvfs(mhdd.dirs[i], &stats[i]);
-      if(ret != 0)
-        return -errno;
-      
-      if(min_block > stats[i].f_bsize)
-        min_block = stats[i].f_bsize;
-      if(min_frame > stats[i].f_frsize)
-        min_frame = stats[i].f_frsize;
-      
-      devices[i] = st.st_dev;
+
+      normalize_statvfs(&tmpstats,mhdd.min_bsize,mhdd.min_frsize,mhdd.namemax);
+      merge_statvfs(&devstats,&tmpstats);
     }
 
-  if(!min_block)
-    min_block = 512;
-  if(!min_frame)
-    min_frame = 512;
-
-  for(i = 0; i < mhdd.dir_count; i++)
-    {
-      if(stats[i].f_bsize > min_block)
-        {
-          stats[i].f_bfree  *=  stats[i].f_bsize / min_block;
-          stats[i].f_bavail *=  stats[i].f_bsize / min_block;
-          stats[i].f_bsize   =  min_block;
-        }
-
-      if(stats[i].f_frsize > min_frame)
-        {
-          stats[i].f_blocks *= stats[i].f_frsize / min_frame;
-          stats[i].f_frsize  = min_frame;
-        }
-    }
-
-  memcpy(buf, stats, sizeof(struct statvfs));
-
-  for(i = 1; i < mhdd.dir_count; i++)
-    {
-      /* if the device already processed, skip it */
-      if(devices[i])
-        {
-          for(j = 0; j < i; j++)
-            {
-              if(devices[j] == devices[i])
-                continue;
-            }
-        }
-
-      if(buf->f_namemax < stats[i].f_namemax)
-        buf->f_namemax = stats[i].f_namemax;
-
-      buf->f_ffree  +=  stats[i].f_ffree;
-      buf->f_files  +=  stats[i].f_files;
-      buf->f_favail +=  stats[i].f_favail;
-      buf->f_bavail +=  stats[i].f_bavail;
-      buf->f_bfree  +=  stats[i].f_bfree;
-      buf->f_blocks +=  stats[i].f_blocks;
-    }
+  memcpy(stat,&devstats,sizeof(struct statvfs));
   
   return 0;
 }
 
 static int
-mhdd_readdir(const char *dirname,
-             void *buf,
-             fuse_fill_dir_t filler,
-             off_t offset,
-             struct fuse_file_info * fi)
+mhdd_readdir(const char            *dirname,
+             void                  *buf,
+             fuse_fill_dir_t        filler,
+             off_t                  offset,
+             struct fuse_file_info *fi)
 {
-  int i, j, found;
+  int i;
+  int dirsfound;
+  int othersfound;
+  char **dirs;
+  struct stat st;
+  char real_path[PATH_MAX];
 
   mhdd_debug(MHDD_MSG, "mhdd_readdir: %s\n", dirname);
-  char **dirs = (char **) calloc(mhdd.dir_count+1, sizeof(char *));
 
-  typedef struct dir_item {
-    char            *name;
-    struct stat     *st;
-    UT_hash_handle   hh;
-  } dir_item;
+  dirs = (char **)alloca((mhdd.dir_count+1) * sizeof(char *));
 
-  dir_item * items_ht = NULL;
-
-
-  struct stat st;
-
-  // find all dirs
-  char fullpath[PATH_MAX];
-  for(i = j = found = 0; i < mhdd.dir_count; i++)
+  // find all dirs, ignore those that aren't
+  dirsfound   = 0;
+  othersfound = 0;
+  for(i = 0; i < mhdd.dir_count; i++)
     {
-      create_path(mhdd.dirs[i], dirname, fullpath);
-      if(stat(fullpath, &st) == 0)
+      create_real_path(mhdd.dirs[i], dirname, real_path, PATH_MAX);
+      if(stat(real_path, &st) == 0)
         {
-          found++;
           if(S_ISDIR(st.st_mode))
-            {
-              dirs[j] = strdup(fullpath);
-              j++;
-              continue;
-            }
+            dirs[dirsfound++] = strdupa(real_path);
+          else
+            othersfound++;
         }
     }
 
+  dirs[dirsfound] = NULL;
+
   // dirs not found
-  if(dirs[0] == 0) {
-    errno = ENOENT;
-    if(found) errno = ENOTDIR;
-    free(dirs);
-    return -errno;
-  }
+  if(dirsfound == 0)
+    return (othersfound > 0 ? -ENOTDIR : -ENOENT);
 
   // read directories
-  for(i = 0; dirs[i]; i++) {
-    struct dirent *de;
-    DIR * dh = opendir(dirs[i]);
-    if(!dh)
-      continue;
+  khash_t(str) *ht = kh_init(str);  
+  for(i = 0; dirs[i] != NULL; i++)
+    {
+      DIR *dh;
+      struct dirent *de;
 
-    while((de = readdir(dh)))
-      {
-        // find dups
-	
-        struct dir_item *prev;
+      dh = opendir(dirs[i]);
+      if(!dh)
+        continue;
+
+      while((de = readdir(dh)))
+        {
+          int rv;
+          char *dup;
+
+          dup = strdup(de->d_name);
+          kh_put(str,ht,dup,&rv);
+          if(rv == 0)
+            continue;
         
-        HASH_FIND_STR(items_ht, de->d_name, prev);
-        
-        if(prev)
-          continue;
-        
-        // add item
-        char object_name[PATH_MAX];
-        create_path(dirs[i], de->d_name, object_name);
-        struct dir_item *new_item =
-          calloc(1, sizeof(struct dir_item));
-        
-        new_item->name = strdup(de->d_name);
-        new_item->st = calloc(1, sizeof(struct stat));
-        lstat(object_name, new_item->st);
-        
-        HASH_ADD_KEYPTR(hh,
-                        items_ht,
-                        new_item->name,
-                        strlen(new_item->name),
-                        new_item);
-      }
+          struct stat st;
+          char object_name[PATH_MAX];
+          create_real_path(dirs[i], de->d_name, object_name, PATH_MAX);
+
+          if(lstat(object_name, &st) == -1)
+            {
+              khiter_t iter;
+              iter = kh_get(str,ht,de->d_name);
+              kh_del(str,ht,iter);
+              continue;
+            }
+
+          filler(buf,de->d_name,&st,0);
+        }
     
-    closedir(dh);
-  }
+      closedir(dh);
+    }
 
-  dir_item *item, *tmp;
+  khiter_t iter;
+  for(iter = kh_begin(ht); iter != kh_end(ht); iter++)
+    if(kh_exist(ht,iter))
+      free((void*)kh_key(ht,iter));
 
-  // fill list
-  HASH_ITER(hh, items_ht, item, tmp) {
-    if(filler(buf, item->name, item->st, 0))
-      break;
-  }
+  kh_destroy(str,ht);
 
-  // free memory
-  HASH_ITER(hh, items_ht, item, tmp) {
-    free(item->name);
-    free(item->st);
-    free(item);
-  }
-  HASH_CLEAR(hh, items_ht);
-
-  for(i = 0; dirs[i]; i++)
-    free(dirs[i]);
-  free(dirs);
   return 0;
 }
 
 // readlink
 static int
-mhdd_readlink(const char *link, char *buf, size_t size)
+mhdd_readlink(const char *fuse_path,
+              char       *buf,
+              size_t      size)
 {
-  char fullpath[PATH_MAX];
+  int rv;
+  char real_path[PATH_MAX];
   
-  mhdd_debug(MHDD_MSG, "mhdd_readlink: %s, size = %d\n", fullpath, size);
+  mhdd_debug(MHDD_MSG, "mhdd_readlink: %s, size = %d\n", real_path, size);
 
-  if(find_fullpath(link,fullpath) != NULL)
-    {
-      memset(buf, 0, size);
-      if(readlink(fullpath, buf, size) >= 0)
-        return 0;
-    }
+  if(find_real_path(fuse_path,real_path,PATH_MAX) == NULL)
+    return -ENOENT;
 
-  return -1;
+  memset(buf, 0, size);
+  rv = readlink(real_path, buf, size);
+  if(rv == -1)
+    return -errno;
+
+  return rv;
 }
 
 #define CREATE_FUNCTION 0
 #define OPEN_FUNCION    1
 // create or open
 static int
-mhdd_internal_open(const char *file, mode_t mode,
-                   struct fuse_file_info *fi, int what)
+mhdd_internal_open(const char            *fuse_path,
+                   mode_t                 mode,
+                   struct fuse_file_info *fi,
+                   int                    what)
 {
   int dir_id, fd;  
-  char fullpath[PATH_MAX];
+  char real_path[PATH_MAX];
   
-  mhdd_debug(MHDD_INFO, "mhdd_internal_open: %s, flags = 0x%X\n",
-             file, fi->flags);
-  
-  if(find_fullpath(file,fullpath) != NULL)
+  if(find_real_path(fuse_path,real_path,PATH_MAX) != NULL)
     {
       if(what == CREATE_FUNCTION)
-        fd = open(fullpath, fi->flags, mode);
+        fd = open(real_path, fi->flags, mode);
       else
-        fd = open(fullpath, fi->flags);
+        fd = open(real_path, fi->flags);
 
       if(fd == -1)
         return -errno;
 
-      struct flist *add = flist_create(file, fullpath, fi->flags, fd);
-      fi->fh = add->id;
-      flist_unlock();
+      {
+        fileinfo_t *fileinfo = calloc(1,sizeof(fileinfo_t));
+
+        fileinfo->fd        = fd;
+        fileinfo->flags     = fi->flags;
+        fileinfo->real_path = strdup(real_path);
+
+        fi->fh = (uint64_t)fileinfo;
+      }
+
+      mhdd_debug(MHDD_MSG,
+                 "mhdd_internal_open: "
+                 "fuse_path: %s; real_path: %s; fd: %d; handle: %lld; flags: 0x%X\n",
+                 fuse_path, real_path, fd, fi->fh, fi->flags);
 
       return 0;
     }
 
-  mhdd_debug(MHDD_INFO, "mhdd_internal_open: new file %s\n", file);
-
   if((dir_id = get_free_dir()) < 0)
-    {
-      errno = ENOSPC;
-      return -errno;
-    }
+    return -ENOSPC;
 
-  create_parent_dirs(dir_id, file);
-  create_path(mhdd.dirs[dir_id], file, fullpath);
+  create_parent_dirs(dir_id, fuse_path);
+  create_real_path(mhdd.dirs[dir_id], fuse_path, real_path, PATH_MAX);
 
-  if(what == CREATE_FUNCTION)
-    fd = open(fullpath, fi->flags, mode);
-  else
-    fd = open(fullpath, fi->flags);
+  fd = (what == CREATE_FUNCTION) ?
+    open(real_path,fi->flags,mode) :
+    open(real_path,fi->flags);
 
   if(fd == -1)
     return -errno;
@@ -344,403 +287,363 @@ mhdd_internal_open(const char *file, mode_t mode,
       fchown(fd, fuse_get_context()->uid, gid);
     }
 
-  struct flist *add = flist_create(file, fullpath, fi->flags, fd);
-  fi->fh = add->id;
-  flist_unlock();
+  {
+    fileinfo_t *fileinfo = calloc(1,sizeof(fileinfo_t));
+
+    fileinfo->fd        = fd;
+    fileinfo->flags     = fi->flags;    
+    fileinfo->real_path = strdup(real_path);
+    
+    fi->fh = (uint64_t)fileinfo;
+  }
+
+  mhdd_debug(MHDD_MSG,
+             "mhdd_internal_open: "
+             "fuse_path: %s; real_path: %s; fd: %d; handle: %lld; flags: 0x%X\n",
+             fuse_path, real_path, fd, fi->fh, fi->flags);
 
   return 0;
 }
 
 // create
 static int
-mhdd_create(const char *file, mode_t mode, struct fuse_file_info *fi)
+mhdd_create(const char            *fuse_path,
+            mode_t                 mode,
+            struct fuse_file_info *fi)
 {
-  mhdd_debug(MHDD_MSG, "mhdd_create: %s, mode = %X\n", file, fi->flags);
+  int rv;
 
-  int res = mhdd_internal_open(file, mode, fi, CREATE_FUNCTION);
-  if(res != 0)
-    mhdd_debug(MHDD_INFO,"mhdd_create: error: %s\n", strerror(-res));
-
-  return res;
+  rv = mhdd_internal_open(fuse_path, mode, fi, CREATE_FUNCTION);
+  if(rv != 0)
+    mhdd_debug(MHDD_MSG,"mhdd_create: error: %s\n", strerror(-rv));
+  
+  return rv;
 }
 
 // open
-static int mhdd_fileopen(const char *file, struct fuse_file_info *fi)
+static int
+mhdd_open(const char            *fuse_path,
+          struct fuse_file_info *fi)
 {
-  mhdd_debug(MHDD_MSG,
-             "mhdd_fileopen: %s, flags = %04X\n", file, fi->flags);
-  int res = mhdd_internal_open(file, 0, fi, OPEN_FUNCION);
-  if(res != 0)
-    mhdd_debug(MHDD_INFO,
-               "mhdd_fileopen: error: %s\n", strerror(-res));
-  return res;
+  int rv;
+  
+  rv = mhdd_internal_open(fuse_path, 0, fi, OPEN_FUNCION);
+  if(rv != 0)
+    mhdd_debug(MHDD_MSG,"mhdd_open: error: %s\n", strerror(-rv));
+
+  return rv;
 }
 
 // close
 static int
-mhdd_release(const char *path, struct fuse_file_info *fi)
+mhdd_release(const char            *fuse_path,
+             struct fuse_file_info *fi)
 {
-  struct flist *del;
-  int fh;
+  fileinfo_t *fileinfo = (fileinfo_t*)fi->fh;
 
-  mhdd_debug(MHDD_MSG, "mhdd_release: %s, handle = %lld\n", path, fi->fh);
-  del = flist_item_by_id_wrlock(fi->fh);
-  if(!del)
+  mhdd_debug(MHDD_MSG,
+             "mhdd_release: "
+             "fuse_path: %s; real_path: %s; fd: %d; handle: %lld\n",
+             fuse_path, fileinfo->real_path, fileinfo->fd, fi->fh);
+
+  if(fileinfo == NULL)
     {
-      mhdd_debug(MHDD_INFO,
-                 "mhdd_release: unknown file number: %llu\n", fi->fh);
-      errno = EBADF;
-      return -errno;
+      mhdd_debug(MHDD_MSG,
+                 "mhdd_release: unknown file number: %llu\n",
+                 fi->fh);
+      return -EBADF;
     }
   
-  fh = del->fh;
-  flist_delete_wrlocked(del);
-  close(fh);
+  free(fileinfo->real_path);
+  close(fileinfo->fd);
+  free(fileinfo);
+
   return 0;
 }
 
 // read
 static int
-mhdd_read(const char *path, char *buf, size_t count, off_t offset,
+mhdd_read(const char            *fuse_path,
+          char                  *buf,
+          size_t                 count,
+          off_t                  offset,
           struct fuse_file_info *fi)
 {
-  ssize_t res;
-  struct flist * info;
-  mhdd_debug(MHDD_INFO, "mhdd_read: %s, offset = %lld, count = %lld\n",
-             path,(long long)offset,(long long)count);
+  ssize_t     rv;
+  fileinfo_t *fileinfo = (fileinfo_t*)fi->fh;
 
-  info = flist_item_by_id(fi->fh);
-  if(!info)
-    {
-      errno = EBADF;
-      return -errno;
-    }
-  
-  res = pread(info->fh, buf, count, offset);
+  mhdd_debug(MHDD_MSG,
+             "mhdd_read: "
+             "fuse_path: %s; real_path: %s; fd: %d; handle: %lld; "
+             "offset: %lld; count: %lld\n",
+             fuse_path, fileinfo->real_path, fileinfo->fd, fi->fh,
+             (long long)offset, (long long)count);
 
-  flist_unlock();
-
-  if(res == -1)
+  rv = pread(fileinfo->fd, buf, count, offset);
+  if(rv == -1)
     return -errno;
-  return res;
+
+  return rv;
 }
 
 // write
 static int
-mhdd_write(const char *path, const char *buf, size_t count,
-           off_t offset, struct fuse_file_info *fi)
+mhdd_write(const char            *fuse_path,
+           const char            *buf,
+           size_t                 count,
+           off_t                  offset,
+           struct fuse_file_info *fi)
 {
-  ssize_t res;
-  struct flist *info;
-  mhdd_debug(MHDD_INFO, "mhdd_write: %s, handle = %lld\n", path, fi->fh);
+  ssize_t rv;
+  fileinfo_t *fileinfo = (fileinfo_t*)fi->fh;
 
-  info = flist_item_by_id(fi->fh);
-  if(!info)
-    {
-      errno = EBADF;
-      return -errno;
-    }
+  mhdd_debug(MHDD_MSG,
+             "mhdd_write: "
+             "fuse_path: %s; real_path: %s; fd: %d; handle = %lld; "
+             "offset: %lld; count: %lld\n",
+             fuse_path, fileinfo->real_path, fileinfo->fd, fi->fh,
+             (long long)offset, (long long)count);
+
+  if(fileinfo == NULL)
+    return -EBADF;
   
-  res = pwrite(info->fh, buf, count, offset);
-  if((res == count) || (res == -1 && errno != ENOSPC))
-    {
-      flist_unlock();
-      if(res == -1)
-        {
-          mhdd_debug(MHDD_DEBUG,
-                     "mhdd_write: error write %s: %s\n",
-                     info->real_name, strerror(errno));
-          return -errno;
-        }
-      return res;
-    }
+  rv = pwrite(fileinfo->fd, buf, count, offset);
+  if(rv == -1)
+    return -errno;
 
-  // end free space
-  if(move_file(info, offset + count) == 0)
-    {
-      res = pwrite(info->fh, buf, count, offset);
-      flist_unlock();
-      if(res == -1)
-        {
-          mhdd_debug(MHDD_DEBUG,
-                     "mhdd_write: error restart write: %s\n",
-                     strerror(errno));
-          return -errno;
-        }
-      if(res < count)
-        {
-          mhdd_debug(MHDD_DEBUG,
-                     "mhdd_write: error (re)write file %s %s\n",
-                     info->real_name,
-                     strerror(ENOSPC));
-        }
-      return res;
-    }
-
-  errno = ENOSPC;
-  flist_unlock();
-  return -errno;
+  return rv;
 }
 
 static int 
-mhdd_ioctl(const char* path, int cmd, void* arg, struct fuse_file_info* fi, unsigned int flags, void* data)
+mhdd_ioctl(const char            *fuse_path,
+           int                    cmd,
+           void                  *arg,
+           struct fuse_file_info *fi,
+           unsigned int           flags,
+           void                  *data)
 {
   int rv;
-  struct flist *info;
+  fileinfo_t *fileinfo = (fileinfo_t*)fi->fh;
    
-  mhdd_debug(MHDD_INFO, "mhdd_ioctl: %s, cmd = %i, arg = %p\n", path, cmd, arg);
-   
-  info = flist_item_by_id(fi->fh);
-  if(!info) 
-    {
-      errno = EBADF;
-      return -errno;
-    }	
+  mhdd_debug(MHDD_MSG,
+             "mhdd_ioctl: %s, cmd = %i, arg = %p\n",
+             fuse_path, cmd, arg);
 
+  if(fileinfo == NULL)
+    return -EBADF;
+  
   switch(cmd)
     {
     case FS_IOC_GETFLAGS:
-      rv = ioctl(info->fh,FS_IOC_GETFLAGS,data);
+      rv = ioctl(fileinfo->fd,FS_IOC_GETFLAGS,data);
       if(rv == -1)
-        rv = -errno;
+        return -errno;
       break;
 
     case FS_IOC_SETFLAGS:
       {
-        int fhflags;
-        cap_t caps;
-        cap_flag_value_t value;
-        struct fuse_context* fc;
+        struct fuse_context *fc;
 
-        rv = ioctl(info->fh,FS_IOC_GETFLAGS,&fhflags);
+        fc = fuse_get_context();
+        rv = ioctl_setflags(fileinfo->fd,fc->pid,data);
         if(rv == -1)
-          {
-            rv = -errno;
-          }
-        else
-          {
-            fc = fuse_get_context();
-            if(fc->uid != 0 &&
-               ((*(int*)data ^ fhflags) & FS_IMMUTABLE_FL))
-              {
-                caps = cap_get_pid(fc->pid);
-                cap_get_flag(caps,CAP_LINUX_IMMUTABLE,CAP_EFFECTIVE,&value);
-		 
-                if(value == CAP_SET)
-                  {
-                    rv = ioctl(info->fh,FS_IOC_SETFLAGS,data);
-                    if(rv == -1)
-                      rv = -errno;
-                  }
-                else
-                  {
-                    rv = -EPERM;
-                  }
-              }
-            else
-              {
-                rv = ioctl(info->fh,FS_IOC_SETFLAGS,data);
-                if(rv == -1)
-                  rv = -errno;
-              }
-          }
+          return -errno;
       }
       break;
-      
+        
     default:
-      errno = ENOTTY;
-      rv = -errno;
-      break;
+      return -ENOTTY;
     }
   
-  flist_unlock();
-  
-  return rv;	
+  return 0;	
 }
 
 // truncate
 static int
-mhdd_truncate(const char *path, off_t size)
+mhdd_truncate(const char *fuse_path,
+              off_t       size)
 {
-  char fullpath[PATH_MAX];
+  int rv;
+  char real_path[PATH_MAX];
   
-  mhdd_debug(MHDD_MSG, "mhdd_truncate: %s\n", path);
+  mhdd_debug(MHDD_MSG,
+             "mhdd_truncate: %s size = %d\n",
+             fuse_path, size);
 
-  if(find_fullpath(path,fullpath))
-    {
-      if(truncate(fullpath,size) == -1)
-        return -errno;
-      return 0;
-    }
+  if(find_real_path(fuse_path,real_path,PATH_MAX) == NULL)
+    return -ENOENT;
 
-  errno = ENOENT;
-  return -errno;
+  rv = truncate(real_path,size);
+  if(rv == -1)
+    return -errno;
+
+  return rv;
 }
 
 // ftrucate
 static int
-mhdd_ftruncate(const char *path, off_t size,
+mhdd_ftruncate(const char            *fuse_path,
+               off_t                  size,
                struct fuse_file_info *fi)
 {
-  int res;
-  struct flist *info;
+  int rv;
+  fileinfo_t *fileinfo = (fileinfo_t*)fi->fh;
+
   mhdd_debug(MHDD_MSG,
-             "mhdd_ftruncate: %s, handle = %lld\n", path, fi->fh);
-  info = flist_item_by_id(fi->fh);
-
-  if(!info) {
-    errno = EBADF;
+             "mhdd_ftruncate: %s, handle = %lld\n",
+             fuse_path, fi->fh);
+  
+  if(fileinfo == NULL)
+    return -EBADF;
+    
+  rv = ftruncate(fileinfo->fd, size);
+  if(rv == -1)
     return -errno;
-  }
 
-  int fh = info->fh;
-  res = ftruncate(fh, size);
-  flist_unlock();
-  if(res == -1)
-    return -errno;
-  return 0;
+  return rv;
 }
 
 // access
 static int
-mhdd_access(const char *path, int mask)
+mhdd_access(const char *fuse_path,
+            int         mask)
 {
-  char fullpath[PATH_MAX];
+  int rv;
+  uid_t uid;
+  gid_t gid;
+  struct fuse_context* fc;
+  char real_path[PATH_MAX];
 
-  mhdd_debug(MHDD_MSG, "mhdd_access: %s mode = %04X\n", path, mask);
+  mhdd_debug(MHDD_MSG,
+             "mhdd_access: %s mode = %04X\n",
+             fuse_path, mask);
 
-  if(find_fullpath(path,fullpath) != NULL)
-    {
-      int res;
-      uid_t uid;
-      gid_t gid;
-      struct fuse_context* fc;
-      
-      fc = fuse_get_context();
-      
-      uid = getuid();
-      gid = getgid();
-      
-      setegid(fc->gid);
-      seteuid(fc->uid);
-
-      res = eaccess(fullpath, mask);
-      
-      seteuid(uid);
-      seteuid(gid);
-      
-      if(res == -1)
-        return -errno;
-      return 0;
-    }
-
-  errno = ENOENT;
-  return -errno;
+  if(find_real_path(fuse_path,real_path,PATH_MAX) == NULL)
+    return -ENOENT;
+    
+  fc = fuse_get_context();
+  
+  uid = getuid();
+  gid = getgid();
+  
+  setegid(fc->gid);
+  seteuid(fc->uid);
+  
+  rv = eaccess(real_path, mask);
+  
+  seteuid(uid);
+  seteuid(gid);
+  
+  if(rv == -1)
+    return -errno;
+  
+  return rv;
 }
 
 // mkdir
 static int
-mhdd_mkdir(const char * path, mode_t mode)
+mhdd_mkdir(const char *fuse_path,
+           mode_t      mode)
 {
-  mhdd_debug(MHDD_MSG, "mhdd_mkdir: %s mode = %04X\n", path, mode);
+  int rv;
+  int dir_id;
+  char real_path[PATH_MAX];
+  char parent_path[PATH_MAX];
+  
+  mhdd_debug(MHDD_MSG,
+             "mhdd_mkdir: fuse_path: %s; mode: %04X\n",
+             fuse_path, mode);
 
-  if(find_fullpath_id(path) != -1)
-    {
-      errno = EEXIST;
-      return -errno;
-    }
+  if(find_real_path_id(fuse_path) != -1)
+    return -EEXIST;
 
-  char *parent = get_parent_path(path);
-  if(!parent)
-    {
-      errno = EFAULT;
-      return -errno;
-    }
+  if(dirname(fuse_path, parent_path, PATH_MAX) == NULL)
+    return -EFAULT;
 
-  if(find_fullpath_id(parent) == -1)
-    {
-      free(parent);
-      errno = EFAULT;
-      return -errno;
-    }
-  free(parent);
+  if(find_real_path_id(parent_path) == -1)
+    return -EFAULT;
 
-  int dir_id = get_free_dir();
+  dir_id = get_free_dir();
   if(dir_id < 0)
-    {
-      errno = ENOSPC;
-      return -errno;
-    }
+    return -ENOSPC;
 
-  char fullpath[PATH_MAX];
-  create_parent_dirs(dir_id, path);
-  create_path(mhdd.dirs[dir_id], path, fullpath);
-  if(mkdir(fullpath, mode) == 0)
+  create_parent_dirs(dir_id, fuse_path);
+  create_real_path(mhdd.dirs[dir_id], fuse_path, real_path, PATH_MAX);
+
+  rv = mkdir(real_path, mode);
+  if(rv == -1)
+    return -errno;
+    
+  if(getuid() == 0)
     {
-      if(getuid() == 0)
+      struct stat st;
+      gid_t gid = fuse_get_context()->gid;
+      if(lstat(real_path, &st) == 0)
         {
-          struct stat st;
-          gid_t gid = fuse_get_context()->gid;
-          if(lstat(fullpath, &st) == 0)
-            {
-              /* parent directory is SGID'ed */
-              if(st.st_gid != getgid())
-                gid = st.st_gid;
-            }
-          chown(fullpath, fuse_get_context()->uid, gid);
+          /* parent directory is SGID'ed */
+          if(st.st_gid != getgid())
+            gid = st.st_gid;
         }
 
-      return 0;
+      chown(real_path, fuse_get_context()->uid, gid);
     }
-
-  return -errno;
+  
+  return rv;
 }
 
 // rmdir
 static int
-mhdd_rmdir(const char * path)
+mhdd_rmdir(const char *fuse_path)
 {
-  char fullpath[PATH_MAX];
+  int rv;
+  char real_path[PATH_MAX];
   
-  mhdd_debug(MHDD_MSG, "mhdd_rmdir: %s\n", path);
+  mhdd_debug(MHDD_MSG,
+             "mhdd_rmdir: %s\n",
+             fuse_path);
 
-  while(find_fullpath(path,fullpath) != NULL)
-    {
-      if(rmdir(fullpath) == -1)
-        return -errno;
-    }
+  if(find_real_path(fuse_path,real_path,PATH_MAX) == NULL)
+    return -ENOENT;
+
+  rv = rmdir(real_path);
+  if(rv == -1)
+    return -errno;
 
   return 0;
 }
 
 // unlink
 static int
-mhdd_unlink(const char *path)
+mhdd_unlink(const char *fuse_path)
 {
-  char fullpath[PATH_MAX];
+  int rv;
+  char real_path[PATH_MAX];
 
-  mhdd_debug(MHDD_MSG, "mhdd_unlink: %s\n", path);
+  mhdd_debug(MHDD_MSG,
+             "mhdd_unlink: %s\n",
+             fuse_path);
 
-  if(find_fullpath(path,fullpath) != NULL)
-    {
-      if(unlink(fullpath) == -1)
-        return -errno;
-      return 0;
-    }
+  if(find_real_path(fuse_path,real_path,PATH_MAX) == NULL)
+    return -ENOENT;
 
-  errno = ENOENT;
-  return -errno;
+  rv = unlink(real_path);
+  if(rv == -1)
+    return -errno;
+
+  return rv;
 }
 
 // rename
 static int
-mhdd_rename(const char *from, const char *to)
+mhdd_rename(const char *from,
+            const char *to)
 {
   mhdd_debug(MHDD_MSG, "mhdd_rename: from = %s to = %s\n", from, to);
 
-  int i, res;
+  int i, rv;
   struct stat sto, sfrom;
-  char fullpath_from[PATH_MAX], fullpath_to[PATH_MAX];
+  char real_path_from[PATH_MAX];
+  char real_path_to[PATH_MAX];
   int from_is_dir = 0, to_is_dir = 0, from_is_file = 0, to_is_file = 0;
   int to_dir_is_empty = 1;
 
@@ -750,21 +653,21 @@ mhdd_rename(const char *from, const char *to)
   /* seek for possible errors */
   for(i = 0; i < mhdd.dir_count; i++)
     {
-      create_path(mhdd.dirs[i], to, fullpath_to);
-      create_path(mhdd.dirs[i], from, fullpath_from);
-      if(stat(fullpath_to, &sto) == 0)
+      create_real_path(mhdd.dirs[i], to,   real_path_to,   PATH_MAX);
+      create_real_path(mhdd.dirs[i], from, real_path_from, PATH_MAX);
+      if(stat(real_path_to, &sto) == 0)
         {
           if(S_ISDIR(sto.st_mode))
             {
               to_is_dir++;
-              if(!dir_is_empty(fullpath_to))
+              if(!dir_is_empty(real_path_to))
                 to_dir_is_empty = 0;
             }
           else
             to_is_file++;
         }
 
-      if(stat(fullpath_from, &sfrom) == 0)
+      if(stat(real_path_from, &sfrom) == 0)
         {
           if(S_ISDIR (sfrom.st_mode))
             from_is_dir++;
@@ -781,21 +684,23 @@ mhdd_rename(const char *from, const char *to)
     }
 
   /* parent 'to' path doesn't exists */
-  char *pto = get_parent_path (to);
-  if(find_fullpath_id(pto) == -1)
-    {
-      free (pto);
+  {
+    char parent_to_path[PATH_MAX];
+
+    if(dirname(to,parent_to_path,PATH_MAX) == NULL)
+      return -EFAULT;
+     
+    if(find_real_path_id(parent_to_path) == -1)
       return -ENOENT;
-    }
-  free(pto);
+  }
 
   /* rename cycle */
   for(i = 0; i < mhdd.dir_count; i++)
     {
-      create_path(mhdd.dirs[i], to, fullpath_to);
-      create_path(mhdd.dirs[i], from, fullpath_from);
+      create_real_path(mhdd.dirs[i], to,   real_path_to,   PATH_MAX);
+      create_real_path(mhdd.dirs[i], from, real_path_from, PATH_MAX);
 
-      if(stat(fullpath_from, &sfrom) == 0)
+      if(stat(real_path_from, &sfrom) == 0)
         {
           /* if from is dir and at the same time file,
              we only rename dir */
@@ -808,9 +713,9 @@ mhdd_rename(const char *from, const char *to)
           create_parent_dirs(i, to);
 
           mhdd_debug(MHDD_MSG, "mhdd_rename: rename %s -> %s\n",
-                     fullpath_from, fullpath_to);
-          res = rename(fullpath_from, fullpath_to);
-          if(res == -1) 
+                     real_path_from, real_path_to);
+          rv = rename(real_path_from, real_path_to);
+          if(rv == -1) 
             return -errno;
         }
       else
@@ -818,10 +723,10 @@ mhdd_rename(const char *from, const char *to)
           /* from and to are files, so we must remove to files */
           if(from_is_file && to_is_file && !from_is_dir)
             {
-              if(stat(fullpath_to, &sto) == 0)
+              if(stat(real_path_to, &sto) == 0)
                 {
-                  mhdd_debug(MHDD_MSG,"mhdd_rename: unlink %s\n",fullpath_to);
-                  if(unlink(fullpath_to) == -1)
+                  mhdd_debug(MHDD_MSG,"mhdd_rename: unlink %s\n",real_path_to);
+                  if(unlink(real_path_to) == -1)
                     return -errno;
                 }
             }
@@ -831,239 +736,202 @@ mhdd_rename(const char *from, const char *to)
   return 0;
 }
 
-// .utimens
 static int
-mhdd_utimens(const char *path, const struct timespec ts[2])
+mhdd_utimens(const char            *fuse_path,
+             const struct timespec  ts[2])
 {
-  char fullpath[PATH_MAX];
-  int i, res, flag_found;
+  int rv;  
+  char real_path[PATH_MAX];
   
-  mhdd_debug(MHDD_MSG, "mhdd_utimens: %s\n", path);
+  mhdd_debug(MHDD_MSG,
+             "mhdd_utimens: %s\n",
+             fuse_path);
 
-  for(i = flag_found = 0; i < mhdd.dir_count; i++)
-    {
-      create_path(mhdd.dirs[i], path, fullpath);
-      struct stat st;
-      if(lstat(fullpath, &st) != 0) 
-        continue;
-      
-      flag_found = 1;
-      struct timeval tv[2];
+  if(find_real_path(fuse_path,real_path,PATH_MAX) == NULL)
+    return -ENOENT;
 
-      tv[0].tv_sec = ts[0].tv_sec;
-      tv[0].tv_usec = ts[0].tv_nsec / 1000;
-      tv[1].tv_sec = ts[1].tv_sec;
-      tv[1].tv_usec = ts[1].tv_nsec / 1000;
-      
-      res = lutimes(fullpath, tv);
-      if(res == -1)
-        return -errno;
-    }
+  rv = utimensat(0, real_path, ts, AT_SYMLINK_NOFOLLOW);
+  if(rv == -1)
+    return -errno;
 
-  if(flag_found)
-    return 0;
-
-  errno = ENOENT;
-  return -errno;
+  return rv;
 }
 
 // .chmod
 static int
-mhdd_chmod(const char *path, mode_t mode)
+mhdd_chmod(const char *fuse_path,
+           mode_t      mode)
 {
-  char fullpath[PATH_MAX];
-  int i;
-  int res = 0;
-  int found = 0;
+  int rv;
+  char real_path[PATH_MAX];
 
-  mhdd_debug(MHDD_MSG, "mhdd_chmod: mode = 0x%03X %s\n", mode, path);
+  mhdd_debug(MHDD_MSG,
+             "mhdd_chmod: fuse_path: %s; mode: 0x%03X\n",
+             fuse_path, mode);
 
-  for(i = 0; i < mhdd.dir_count; i++)
-    {
-      create_path(mhdd.dirs[i], path, fullpath);
-      struct stat st;
-      if(lstat(fullpath, &st) != 0)
-        continue;
-
-      found = 1;
-      res = chmod(fullpath, mode);
-      if(res == -1)
-        return -errno;
-    }
-
-  if(found)
-    return 0;
+  if(find_real_path(fuse_path,real_path,PATH_MAX) == NULL)
+    return -ENOENT;
   
-  errno = ENOENT;
-  return -errno;
+  rv = chmod(real_path, mode);
+  if(rv == -1)
+    return -errno;
+  
+  return rv;
 }
 
 // chown
 static int
-mhdd_chown(const char *path, uid_t uid, gid_t gid)
+mhdd_chown(const char *fuse_path,
+           uid_t       uid,
+           gid_t       gid)
 {
-  char fullpath[PATH_MAX];
-  int i, res, flag_found;
+  int rv;
+  char real_path[PATH_MAX];
   
   mhdd_debug(MHDD_MSG,
-             "mhdd_chown: pid = 0x%03X gid = %03X %s\n", uid, gid, path);
+             "mhdd_chown: fuse_path: %s; pid: 0x%03X; gid: %03X\n",
+             fuse_path, uid, gid);
 
-  for(i = flag_found = 0; i < mhdd.dir_count; i++)
-    {
-      create_path(mhdd.dirs[i], path, fullpath);
-      struct stat st;
-      if(lstat(fullpath, &st) != 0) 
-        continue;
+  if(find_real_path(fuse_path,real_path,PATH_MAX) == NULL)
+    return -ENOENT;
+  
+  rv = lchown(real_path, uid, gid);
+  if(rv == -1)
+    return -errno;
 
-      flag_found = 1;
-      res = lchown(fullpath, uid, gid);
-      if(res == -1)
-        return -errno;
-    }
-
-  if(flag_found)
-    return 0;
-  errno = ENOENT;
-  return -errno;
+  return rv;
 }
 
 // symlink
 static int
-mhdd_symlink(const char *from, const char *to)
+mhdd_symlink(const char *from,
+             const char *to)
 {
-  int i, res;  
-  char fullpath[PATH_MAX];
-  
-  mhdd_debug(MHDD_MSG, "mhdd_symlink: from = %s to = %s\n", from, to);
+  int rv;
+  int dir_id;
+  char real_path[PATH_MAX];
+  char parent_path[PATH_MAX];
 
-  char *parent = get_parent_path(to);
-  if(!parent)
-    {
-      errno = ENOENT;
-      return -errno;
-    }
-  
-  int dir_id = find_fullpath_id(parent);
-  free(parent);
+  mhdd_debug(MHDD_MSG,
+             "mhdd_symlink: from = %s to = %s\n",
+             from, to);
 
+  if(dirname(to,parent_path,PATH_MAX) == NULL)
+    return -ENOENT;
+
+  dir_id = find_real_path_id(parent_path);
   if(dir_id == -1)
-    {
-      errno = ENOENT;
-      return -errno;
-    }
+    return -ENOENT;
+
+  create_real_path(mhdd.dirs[dir_id],to,real_path,PATH_MAX);
+  rv = symlink(from,real_path);
+  if(rv == 0)
+    return 0;
+  else if(errno != ENOSPC)
+    return -errno;
+
+  dir_id = get_free_dir();
+  if(dir_id == -1)
+    return -ENOSPC;
+
+  create_parent_dirs(dir_id,to);
+  create_real_path(mhdd.dirs[dir_id],to,real_path,PATH_MAX);
+
+  rv = symlink(from,real_path);
+  if(rv == -1)
+    return -errno;
+
+  return rv;
+}
+
+// link
+static int
+mhdd_link(const char *from,
+          const char *to)
+{
+  int rv;
+  int dir_id;
   
+  mhdd_debug(MHDD_MSG,
+             "mhdd_link: from: %s; to: %s\n",
+             from, to);
+
+  dir_id = find_real_path_id(from);
+  if(dir_id == -1)
+    return -ENOENT;
+
+  rv = create_parent_dirs(dir_id, to);
+  if(rv == -1)
+    return -errno;
+
+  char real_path_from[PATH_MAX];
+  char real_path_to[PATH_MAX];
+  
+  create_real_path(mhdd.dirs[dir_id], from, real_path_from, PATH_MAX);
+  create_real_path(mhdd.dirs[dir_id], to,   real_path_to,   PATH_MAX);
+
+  rv = link(real_path_from, real_path_to);
+  if(rv == -1 )
+    return -errno;
+
+  return rv;
+}
+
+// mknod
+static int
+mhdd_mknod(const char *fuse_path,
+           mode_t      mode,
+           dev_t       rdev)
+{
+  int rv, i;
+  int dir_id;
+  char real_path[PATH_MAX];
+  char fuse_parent_path[PATH_MAX];
+  
+  mhdd_debug(MHDD_MSG,
+             "mhdd_mknod: fuse_path: %s; mode: %X; rdev: %X\n",
+             fuse_path, mode, rdev);
+
+  if(dirname(fuse_path,fuse_parent_path,PATH_MAX) == NULL)
+    return -ENOENT;
+  
+  dir_id = find_real_path_id(fuse_parent_path);
+  if(dir_id == -1)
+    return -ENOENT;
+
   for(i = 0; i < 2; i++)
     {
       if(i)
         {
           if((dir_id = get_free_dir()) < 0)
-            {
-              errno = ENOSPC;
-              return -errno;
-            }
-          
-          create_parent_dirs(dir_id, to);
+            return -ENOSPC;
+
+          create_parent_dirs(dir_id, fuse_path);
         }
 
-      create_path(mhdd.dirs[dir_id], to, fullpath);
-
-      res = symlink(from, fullpath);
-      if(res == 0)
-        return 0;
-      if(errno != ENOSPC)
-        return -errno;
-    }
-
-  return -errno;
-}
-
-// link
-static int
-mhdd_link(const char *from, const char *to)
-{
-  mhdd_debug(MHDD_MSG, "mhdd_link: from = %s to = %s\n", from, to);
-
-  int dir_id = find_fullpath_id(from);
-
-  if(dir_id == -1) {
-    errno = ENOENT;
-    return -errno;
-  }
-
-  int res = create_parent_dirs(dir_id, to);
-  if(res != 0) {
-    return res;
-  }
-
-  char fullpath_from[PATH_MAX];
-  char fullpath_to[PATH_MAX];
-  
-  create_path(mhdd.dirs[dir_id], from, fullpath_from);
-  create_path(mhdd.dirs[dir_id], to, fullpath_to);
-
-  res = link(fullpath_from, fullpath_to);
-  if(res == 0)
-    return 0;
-  return -errno;
-}
-
-// mknod
-static int
-mhdd_mknod(const char *path, mode_t mode, dev_t rdev)
-{
-  int res, i;
-  char fullpath[PATH_MAX];
-  
-  mhdd_debug(MHDD_MSG, "mhdd_mknod: path = %s mode = %X\n", path, mode);
-
-  char *parent = get_parent_path(path);
-  if(!parent)
-    {
-      errno = ENOENT;
-      return -errno;
-    }
-  
-  int dir_id = find_fullpath_id(parent);
-  free(parent);
-
-  if(dir_id == -1)
-    {
-      errno = ENOENT;
-      return -errno;
-    }
-
-  for(i = 0; i < 2; i++)
-    {
-      if(i)
-        {
-          if((dir_id = get_free_dir())<0)
-            {
-              errno = ENOSPC;
-              return -errno;
-            }
-          create_parent_dirs(dir_id, path);
-        }
-
-      create_path(mhdd.dirs[dir_id], path, fullpath);
+      create_real_path(mhdd.dirs[dir_id], fuse_path, real_path, PATH_MAX);
 
       if(S_ISREG(mode))
         {
-          res = open(fullpath, O_CREAT | O_EXCL | O_WRONLY, mode);
-          if(res >= 0)
-            res = close(res);
+          rv = open(real_path, O_CREAT | O_EXCL | O_WRONLY, mode);
+          if(rv >= 0)
+            rv = close(rv);
         }
       else if(S_ISFIFO(mode))
-        res = mkfifo(fullpath, mode);
+        {
+          rv = mkfifo(real_path, mode);
+        }
       else
-        res = mknod(fullpath, mode, rdev);
+        {
+          rv = mknod(real_path, mode, rdev);
+        }
 
-      if(res != -1)
+      if(rv != -1)
         {
           if(getuid() == 0)
             {
-              struct fuse_context * fcontext =
-                fuse_get_context();
-              chown(fullpath, fcontext->uid, fcontext->gid);
+              struct fuse_context * fcontext = fuse_get_context();
+              chown(real_path, fcontext->uid, fcontext->gid);
             }
 
           return 0;
@@ -1084,16 +952,18 @@ mhdd_mknod(const char *path, mode_t mode, dev_t rdev)
 
 //fsync
 static int
-mhdd_fsync(const char *path, int isdatasync, struct fuse_file_info *fi)
+mhdd_fsync(const char            *fuse_path,
+           int                    isdatasync,
+           struct fuse_file_info *fi)
 {
-  int rv;  
-  struct flist *info;
+  int rv;
+  fileinfo_t *fileinfo = (fileinfo_t*)fi->fh;
 
   mhdd_debug(MHDD_MSG,
-             "mhdd_fsync: path = %s handle = %llu\n", path, fi->fh);
+             "mhdd_fsync: path = %s handle = %llu\n",
+             fuse_path, fi->fh);
 
-  info = flist_item_by_id(fi->fh);
-  if(!info)
+  if(fileinfo == NULL)
     {
       errno = EBADF;
       return -errno;
@@ -1101,14 +971,14 @@ mhdd_fsync(const char *path, int isdatasync, struct fuse_file_info *fi)
 
 #ifdef HAVE_FDATASYNC
   if(isdatasync)
-    rv = fdatasync(info->fh);
+    rv = fdatasync(fileinfo->fd);
   else
 #endif
-    rv = fsync(info->fh);
+    rv = fsync(fileinfo->fd);
 
-  flist_unlock();
   if(rv == -1)
     return -errno;
+
   return rv;
 }
 
@@ -1116,13 +986,16 @@ mhdd_fsync(const char *path, int isdatasync, struct fuse_file_info *fi)
 
 #ifndef WITHOUT_XATTR
 static int
-mhdd_setxattr(const char *path, const char *attrname,
-              const char *attrval, size_t attrvalsize, int flags)
+mhdd_setxattr(const char *fuse_path,
+              const char *attrname,
+              const char *attrval,
+              size_t      attrvalsize,
+              int         flags)
 {
   int rv;
   char real_path[PATH_MAX];
   
-  if(find_fullpath(path,real_path) == NULL)
+  if(find_real_path(fuse_path,real_path,PATH_MAX) == NULL)
     return -ENOENT;
 
   mhdd_debug(MHDD_MSG,
@@ -1132,17 +1005,22 @@ mhdd_setxattr(const char *path, const char *attrname,
   rv = setxattr(real_path, attrname, attrval, attrvalsize, flags);
   if(rv == -1)
     return -errno;
+
   return rv;
 }
 #endif
 
 #ifndef WITHOUT_XATTR
-static int mhdd_getxattr(const char *path, const char *attrname, char *buf, size_t count)
+static int
+mhdd_getxattr(const char *fuse_path,
+              const char *attrname,
+              char       *buf,
+              size_t      count)
 {
   int rv;
   char real_path[PATH_MAX];
 
-  if(find_fullpath(path,real_path) == NULL)
+  if(find_real_path(fuse_path,real_path,PATH_MAX) == NULL)
     return -ENOENT;
 
   mhdd_debug(MHDD_MSG,
@@ -1152,17 +1030,21 @@ static int mhdd_getxattr(const char *path, const char *attrname, char *buf, size
   rv = getxattr(real_path, attrname, buf, count);
   if(rv == -1)
     return -errno;
+
   return rv;
 }
 #endif
 
 #ifndef WITHOUT_XATTR
-static int mhdd_listxattr(const char *path, char *buf, size_t count)
+static int
+mhdd_listxattr(const char *fuse_path,
+               char       *buf,
+               size_t      count)
 {
   int rv;
   char real_path[PATH_MAX];
   
-  if(find_fullpath(path,real_path) == NULL)
+  if(find_real_path(fuse_path,real_path,PATH_MAX) == NULL)
     return -ENOENT;
   
   mhdd_debug(MHDD_MSG,
@@ -1170,20 +1052,22 @@ static int mhdd_listxattr(const char *path, char *buf, size_t count)
              real_path, count);
 
   rv = listxattr(real_path, buf, count);
-
   if(rv == -1)
     return -errno;
+
   return rv;
 }
 #endif
 
 #ifndef WITHOUT_XATTR
-static int mhdd_removexattr(const char *path, const char *attrname)
+static int
+mhdd_removexattr(const char *fuse_path,
+                 const char *attrname)
 {
   int rv;
   char real_path[PATH_MAX];
 
-  if(find_fullpath(path,real_path) == NULL)
+  if(find_real_path(fuse_path,real_path,PATH_MAX) == NULL)
     return -ENOENT;
 
   mhdd_debug(MHDD_MSG,
@@ -1197,46 +1081,82 @@ static int mhdd_removexattr(const char *path, const char *attrname)
 }
 #endif
 
+static int
+mhdd_fallocate(const char            *fuse_path,
+               int                    mode,
+               off_t                  offset,
+               off_t                  len,
+               struct fuse_file_info *fi)
+{
+  int rv;
+  fileinfo_t *fileinfo = (fileinfo_t*)fi->fh;
+
+  rv = myfallocate(fileinfo->fd,mode,offset,len);
+  if(rv == -1)
+    return -errno;
+
+  return rv;
+}
+               
+
 // functions links
-static struct fuse_operations mhdd_oper = {
-  .getattr    	= mhdd_stat,
-  .statfs     	= mhdd_statfs,
-  .readdir    	= mhdd_readdir,
-  .readlink   	= mhdd_readlink,
-  .open       	= mhdd_fileopen,
-  .release    	= mhdd_release,
-  .read       	= mhdd_read,
-  .write      	= mhdd_write,
-  .create     	= mhdd_create,
-  .truncate   	= mhdd_truncate,
-  .ftruncate  	= mhdd_ftruncate,
-  .access     	= mhdd_access,
-  .mkdir      	= mhdd_mkdir,
-  .rmdir      	= mhdd_rmdir,
-  .unlink     	= mhdd_unlink,
-  .rename     	= mhdd_rename,
-  .utimens    	= mhdd_utimens,
-  .chmod      	= mhdd_chmod,
-  .chown      	= mhdd_chown,
-  .symlink    	= mhdd_symlink,
-  .mknod      	= mhdd_mknod,
-  .fsync      	= mhdd_fsync,
-  .link		= mhdd_link,
-  .ioctl        = mhdd_ioctl,
+static struct fuse_operations mhdd_oper =
+  {
+    .getattr     = mhdd_stat,
+    .fgetattr    = NULL, 
+    .statfs      = mhdd_statfs,
+    .readdir     = mhdd_readdir,
+    .readlink    = mhdd_readlink,
+    .open        = mhdd_open,
+    .release     = mhdd_release,
+    .read        = mhdd_read,
+    .write       = mhdd_write,
+    .create      = mhdd_create,
+    .truncate    = mhdd_truncate,
+    .ftruncate   = mhdd_ftruncate,
+    .access      = mhdd_access,
+    .mkdir       = mhdd_mkdir,
+    .rmdir       = mhdd_rmdir,
+    .unlink      = mhdd_unlink,
+    .rename      = mhdd_rename,
+    .utimens     = mhdd_utimens,
+    .chmod       = mhdd_chmod,
+    .chown       = mhdd_chown,
+    .symlink     = mhdd_symlink,
+    .mknod       = mhdd_mknod,
+    .fsync       = mhdd_fsync,
+    .link	 = mhdd_link,
+    .ioctl       = mhdd_ioctl,
 #ifndef WITHOUT_XATTR
-  .setxattr   	= mhdd_setxattr,
-  .getxattr   	= mhdd_getxattr,
-  .listxattr  	= mhdd_listxattr,
-  .removexattr	= mhdd_removexattr,
+    .setxattr    = mhdd_setxattr,
+    .getxattr    = mhdd_getxattr,
+    .listxattr   = mhdd_listxattr,
+    .removexattr = mhdd_removexattr,
 #endif
-};
+    .fallocate   = mhdd_fallocate
+  };
 
 
 // start
-int main(int argc, char *argv[])
+int
+main(int   argc,
+     char *argv[])
 {
+  int rv;
+  struct fuse_args *args;
+
+  umask(0);
+
+  mhdd_asserts();
+  
   mhdd_debug_init();
-  struct fuse_args *args = parse_options(argc, argv);
-  flist_init();
-  return fuse_main(args->argc, args->argv, &mhdd_oper, 0);
+
+  args = parse_options(argc, argv);
+
+  rv = fuse_main(args->argc,
+                 args->argv,
+                 &mhdd_oper,
+                 0);
+
+  return rv;
 }

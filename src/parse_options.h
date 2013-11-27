@@ -24,27 +24,32 @@
 #include <stdint.h>
 #include <fuse.h>
 
-struct mhdd_config
+#define DEFAULT_MOVE_LIMIT ( 4UL * 1024 * 1024 * 1024 )
+#define MINIMUM_MOVE_LIMIT ( 50UL * 1024 * 1024 )
+
+typedef struct mhdd_config_t
 {
-  char *mount;
+  char           *mount;
+  char          **dirs; 
+  uint32_t        dir_count;
+  dev_t          *devices;
+  int            *device_fds;
+  uint32_t        device_count;
+  unsigned long   min_bsize;
+  unsigned long   min_frsize;
+  unsigned long   namemax;
+  long            pathmax;
+  off_t           move_limit;
+  char           *move_limit_str;
+  FILE           *debug;
+  char           *debug_file;
+  int             log_level;
+} mhdd_config_t;
 
-  char   **dirs; 
-  uint32_t dir_count;
+extern mhdd_config_t mhdd;
 
-  dev_t   *devices;
-  uint32_t device_count;
-
-  off_t  move_limit;
-  char  *move_limit_str;  
-
-  FILE  *debug;
-  char  *debug_file;
-
-  int   log_level;
-};
-
-extern struct mhdd_config mhdd;
-
-struct fuse_args * parse_options(int argc, char *argv[]);
+struct fuse_args *
+parse_options(int   argc,
+              char *argv[]);
 
 #endif

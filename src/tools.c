@@ -19,6 +19,10 @@
   (added support for extended attributes.)
 */
 
+#define _XOPEN_SOURCE 600
+#define _POSIX_C_SOURCE 200112L
+#define _GNU_SOURCE
+
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -26,11 +30,14 @@
 #include <sys/statvfs.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
+#include <sys/capability.h>
 #include <errno.h>
 #include <utime.h>
 #include <fcntl.h>
-#include <sys/types.h>
 #include <dirent.h>
+#include <linux/fs.h>
+#include <assert.h>
 
 #ifndef WITHOUT_XATTR
 #include <attr/xattr.h>
@@ -49,55 +56,62 @@ get_free_dir(void)
   struct statvfs stf;
   fsblkcnt_t max_space = 0;
 
-  for (max = i = 0; i < mhdd.dir_count; i++) {
+  for (max = i = 0; i < mhdd.dir_count; i++)
+    {
+      if(statvfs(mhdd.dirs[i], &stf) != 0)
+        continue;
 
-    if(statvfs(mhdd.dirs[i], &stf) != 0)
-      continue;
-    fsblkcnt_t space  = stf.f_bsize;
-    space *= stf.f_bavail;
+      fsblkcnt_t space = stf.f_bsize * stf.f_bavail;
 
-    if(mhdd.move_limit <= 100) {
+      if(mhdd.move_limit <= 100)
+        {
+          int perc;
 
-      int perc;
+          if(mhdd.move_limit != 100)
+            {
+              fsblkcnt_t perclimit = stf.f_blocks;
 
-      if(mhdd.move_limit != 100) {
-        fsblkcnt_t perclimit = stf.f_blocks;
+              if(mhdd.move_limit != 99)
+                {
+                  perclimit *= mhdd.move_limit + 1;
+                  perclimit /= 100;
+                }
 
-        if(mhdd.move_limit != 99) {
-          perclimit *= mhdd.move_limit + 1;
-          perclimit /= 100;
+              if(stf.f_bavail >= perclimit)
+                return i;
+            }
+
+          perc = 100 * stf.f_bavail / stf.f_blocks;
+
+          if(perc > max_perc_space)
+            {
+              max_perc_space = perc;
+              max_perc = i;
+            }
+        }
+      else
+        {
+          if(space >= mhdd.move_limit)
+            return i;
         }
 
-        if(stf.f_bavail >= perclimit)
-          return i;
-      }
-
-      perc = 100 * stf.f_bavail / stf.f_blocks;
-
-      if(perc > max_perc_space) {
-        max_perc_space = perc;
-        max_perc = i;
-      }
-    } else {
-      if(space >= mhdd.move_limit)
-        return i;
+      if(space > max_space)
+        {
+          max_space = space;
+          max = i;
+        }
     }
 
-    if(space > max_space) {
-      max_space = space;
-      max = i;
+  if(!max_space && !max_perc_space)
+    {
+      mhdd_debug(MHDD_INFO,
+                 "get_free_dir: Can't find freespace\n");
+      return -1;
     }
-  }
-
-
-  if(!max_space && !max_perc_space) {
-    mhdd_debug(MHDD_INFO,
-               "get_free_dir: Can't find freespace\n");
-    return -1;
-  }
 
   if(max_perc_space)
     return max_perc;
+
   return max;
 }
 
@@ -110,120 +124,85 @@ find_free_space(off_t size)
   struct statvfs stf;
   fsblkcnt_t max_space=0;
 
-  for (max=-1,i=0; i<mhdd.dir_count; i++)
+  for(max = -1, i = 0; i < mhdd.dir_count; i++)
     {
-      if(statvfs(mhdd.dirs[i], &stf)!=0)
+      if(statvfs(mhdd.dirs[i], &stf) != 0)
         continue;
+      
+      fsblkcnt_t space = stf.f_bsize * stf.f_bavail;
 
-      fsblkcnt_t space  = stf.f_bsize;
-      space *= stf.f_bavail;
-
-      if(space>size+mhdd.move_limit)
+      if(space > (size + mhdd.move_limit))
         return i;
 
-      if(space>size && (max<0 || max_space<space))
+      if((space > size) &&
+         (max < 0 || max_space < space))
         {
-          max_space=space;
-          max=i;
+          max_space = space;
+          max = i;
         }
     }
+
   return max;
 }
 
 static int
-reopen_files(struct flist * file, const char *new_name)
+reopen_files(fileinfo_t *fileinfo,
+             const char *new_real_path)
 {
-  int i;
-  struct flist ** rlist;
-  int error = 0;
+  mhdd_debug(MHDD_INFO,
+             "reopen_files: %s -> %s\n",
+             fileinfo->real_path, new_real_path);
 
-  mhdd_debug(MHDD_INFO, "reopen_files: %s -> %s\n",
-             file->real_name, new_name);
-  rlist = flist_items_by_eq_name(file);
-  if(!rlist)
-    return 0;
-
-  for (i = 0; rlist[i]; i++)
-    {
-      struct flist * next = rlist[i];
-      
-      off_t seek = lseek(next->fh, 0, SEEK_CUR);
-      int flags = next->flags;
-      int fh;
-      
-      flags &= ~(O_EXCL|O_TRUNC);
-      
-      // open
-      if((fh = open(new_name, flags)) == -1)
-        {
-          mhdd_debug(MHDD_INFO,
-                     "reopen_files: error reopen: %s\n",
-                     strerror(errno));
-          if(!i)
-            {
-              error = errno;
-              break;
-            }
-          close(next->fh);
-        }
-      else
-        {
-          // seek
-          if(seek != lseek(fh, seek, SEEK_SET))
-            {
-              mhdd_debug(MHDD_INFO,
-                         "reopen_files: error seek %s\n",
-                         strerror(errno));
-              close(fh);
-              if(!i)
-                {
-                  error = errno;
-                  break;
-                }
-            }
-          
-          // filehandle
-          if(dup2(fh, next->fh) != next->fh)
-            {
-              mhdd_debug(MHDD_INFO,
-                         "reopen_files: error dup2 %s\n",
-                         strerror(errno));
-              close(fh);
-              if(!i)
-                {
-                  error = errno;
-                  break;
-                }
-            }
-          // close temporary filehandle
-          mhdd_debug(MHDD_MSG,
-                     "reopen_files: reopened %s (to %s) old h=%x "
-                     "new h=%x seek=%lld\n",
-                     next->real_name, new_name, next->fh, fh, seek);
-          close(fh);
-        }
-    }
+  int   newfd;
+  int   flags    = fileinfo->flags & ~(O_EXCL|O_TRUNC);
+  off_t cur_seek = lseek(fileinfo->fd, 0, SEEK_CUR);
   
-  if(error)
+  newfd = open(new_real_path, flags);
+  if(newfd == -1)
     {
-      free(rlist);
-      return -error;
+      mhdd_debug(MHDD_INFO,
+                 "reopen_files: error reopen: %s\n",
+                 strerror(errno));
+      return -errno;
     }
 
-  /* change real_name */
-  for (i = 0; rlist[i]; i++)
+  if(cur_seek != lseek(newfd, cur_seek, SEEK_SET))
     {
-      free(rlist[i]->real_name);
-      rlist[i]->real_name = strdup(new_name);
+      mhdd_debug(MHDD_INFO,
+                 "reopen_files: error seek %s\n",
+                 strerror(errno));
+      close(newfd);
+
+      return -errno;
+    }
+      
+  if(dup2(newfd, fileinfo->fd) != fileinfo->fd)
+    {
+      mhdd_debug(MHDD_INFO,
+                 "reopen_files: error dup2 %s\n",
+                 strerror(errno));
+      close(newfd);
+
+      return -errno;
     }
 
-  free(rlist);
+  mhdd_debug(MHDD_MSG,
+             "reopen_file: reopened %s (to %s) old h=%x "
+             "new h=%x seek=%lld\n",
+             fileinfo->real_path, new_real_path, fileinfo->fd, newfd, cur_seek);
+
+  close(newfd);
+
+  free(fileinfo->real_path);
+  fileinfo->real_path = strdup(new_real_path);
 
   return 0;
 }
 
 int
-move_file(struct flist * file, off_t wsize)
+move_file(const char *fuse_path,
+          fileinfo_t *fileinfo,
+          const off_t wsize)
 {
   char from[PATH_MAX], to[PATH_MAX], to_tmp[PATH_MAX];
   off_t size;
@@ -235,20 +214,22 @@ move_file(struct flist * file, off_t wsize)
   fsblkcnt_t space;
   struct stat st;
 
-  mhdd_debug(MHDD_MSG, "move_file: %s\n", file->real_name);
+  mhdd_debug(MHDD_MSG,
+             "move_file: real_path = %s\n",
+             fileinfo->real_path);
 
   /* TODO: it would be nice to contrive something alter */
-  flist_wrlock_locked();
-  strcpy(from, file->real_name);
+  strncpy(from, fileinfo->real_path, PATH_MAX);
   
   /* We need to check if already moved */
   if(statvfs(from, &svf) != 0)
     return -errno;
-  space = svf.f_bsize;
+
+  space  = svf.f_bsize;
   space *= svf.f_bavail;
 
   /* get file size */
-  if(fstat(file->fh, &st) != 0)
+  if(fstat(fileinfo->fd, &st) != 0)
     {
       mhdd_debug(MHDD_MSG, "move_file: error stat %s: %s\n",
                  from, strerror(errno));
@@ -261,8 +242,8 @@ move_file(struct flist * file, off_t wsize)
      the space from the source device during unlink. */
   if(st.st_nlink > 1)
     {
-      mhdd_debug(MHDD_MSG, "move_file: cannot move "
-                 "files with >1 hardlinks\n");
+      mhdd_debug(MHDD_MSG,
+                 "move_file: cannot move files with >1 hardlinks\n");
       return -ENOTSUP;
     }
 
@@ -282,10 +263,9 @@ move_file(struct flist * file, off_t wsize)
   if(!(input = fopen(from, "r")))
     return -errno;
 
-  create_parent_dirs(dir_id, file->name);
-
-  create_path(mhdd.dirs[dir_id], file->name, to);
-  create_tmppath(mhdd.dirs[dir_id], file->name, to_tmp);
+  create_parent_dirs(dir_id, fuse_path);
+  create_real_path(mhdd.dirs[dir_id],    fuse_path, to,     PATH_MAX);
+  create_real_tmppath(mhdd.dirs[dir_id], fuse_path, to_tmp, PATH_MAX);
 
   outfd = mkstemp(to_tmp);
   if(outfd == -1)
@@ -357,33 +337,107 @@ move_file(struct flist * file, off_t wsize)
       return -1;
     }
   
-  ret = reopen_files(file, to);
+  ret = reopen_files(fileinfo, to);
   if(ret == 0)
     unlink(from);      
   else
     unlink(to);
 
-  mhdd_debug(MHDD_MSG, "move_file: %s -> %s: done, code=%d\n",
+  mhdd_debug(MHDD_MSG,
+             "move_file: %s -> %s: done, code=%d\n",
              from, to, ret);
 
   return ret;
 }
 
 #ifndef WITHOUT_XATTR
-int
-copy_xattrs(const char *from, const char *to)
+static int
+my_getxattr(const char  *path,
+            const char  *name,
+            void       **value,
+            size_t      *size)
 {
-  int listsize=0, attrvalsize=0;
-  char *listbuf=NULL, *attrvalbuf=NULL,
-    *name_begin=NULL, *name_end=NULL;
+  int rv;
 
-  // if not xattrs on source, then do nothing
-  if((listsize=listxattr(from, NULL, 0)) == 0)
-    return 0;
+  if(*size != 0)
+    rv = getxattr(path, name, *value, *size);
+  else
+    (rv = -1,errno = ERANGE);
+  
+  if(rv == -1 && errno == ERANGE)
+    {
+      rv = getxattr(path,name,NULL,0);
+      if(rv == -1)
+        return -1;
 
-  // get all extended attributes
-  listbuf=(char *)calloc(sizeof(char), listsize);
-  if(listxattr(from, listbuf, listsize) == -1)
+      {
+        void *new_value;
+        
+        new_value = realloc(*value,rv);
+        if(new_value == NULL)
+          return -1;
+        
+        *size  = rv;
+        *value = new_value;
+        
+        return my_getxattr(path,name,value,size);
+      }
+    }
+      
+  return rv;
+}
+
+static int
+my_listxattr(const char  *path,
+             char       **list,
+             size_t      *size)
+{
+  int rv;
+
+  if(*size != 0)
+    rv = listxattr(path,*list,*size);
+  else
+    (rv = -1,errno = ERANGE);
+    
+  if(rv == -1 && errno == ERANGE)
+    {
+      rv = listxattr(path,NULL,0);
+      if(rv == -1)
+        return -1;
+
+      {
+        void *new_value;
+
+        new_value = realloc(*list,rv);
+        if(new_value == NULL)
+          return -1;
+
+        *size = rv;
+        *list = new_value;
+
+        return my_listxattr(path,list,size);
+      }
+    }
+  
+  return rv;
+}
+
+int
+copy_xattrs(const char *from,
+            const char *to)
+{
+  int     rv;
+  size_t  listbufsize;
+  size_t  attrvalsize;
+  char   *listbuf;
+  char   *attrvalbuf;
+  char   *name_begin;
+  char   *name_end;
+
+  listbufsize = mhdd.namemax;
+  listbuf     = (char*)calloc(1,listbufsize);
+  rv = my_listxattr(from,&listbuf,&listbufsize);
+  if(rv == -1)
     {
       mhdd_debug(MHDD_MSG,
                  "listxattr: error listing xattrs on %s : %s\n",
@@ -391,27 +445,16 @@ copy_xattrs(const char *from, const char *to)
       return -1;
     }
 
-  // loop through each xattr
-  for(name_begin=listbuf, name_end=listbuf+1;
-      name_end < (listbuf + listsize); name_end++)
+  attrvalsize = mhdd.namemax;
+  attrvalbuf  = (char*)malloc(attrvalsize);
+  for(name_begin = listbuf, name_end = listbuf + 1;
+      name_end < (listbuf + listbufsize); name_end++)
     {
-      // skip the loop if we're not at the end of an attribute name
       if(*name_end != '\0')
         continue;
 
-      // get the size of the extended attribute
-      attrvalsize = getxattr(from, name_begin, NULL, 0);
-      if(attrvalsize < 0)
-        {
-          mhdd_debug(MHDD_MSG,
-                     "getxattr: error getting xattr size on %s name %s : %s\n",
-                     from, name_begin, strerror(errno));
-          return -1;
-        }
-
-      // get the value of the extended attribute
-      attrvalbuf=(char *)calloc(sizeof(char), attrvalsize);
-      if(getxattr(from, name_begin, attrvalbuf, attrvalsize) < 0)
+      rv = my_getxattr(from, name_begin, (void**)&attrvalbuf, &attrvalsize);
+      if(rv == -1)
         {
           mhdd_debug(MHDD_MSG,
                      "getxattr: error getting xattr value on %s name %s : %s\n",
@@ -420,7 +463,8 @@ copy_xattrs(const char *from, const char *to)
         }
 
       // set the value of the extended attribute on dest file
-      if(setxattr(to, name_begin, attrvalbuf, attrvalsize, 0) < 0)
+      rv = setxattr(to, name_begin, attrvalbuf, attrvalsize, 0);
+      if(rv == -1)
         {
           mhdd_debug(MHDD_MSG,
                      "setxattr: error setting xattr value on %s name %s : %s\n",
@@ -428,72 +472,81 @@ copy_xattrs(const char *from, const char *to)
           return -1;
         }
 
-      free(attrvalbuf);
-
       // point the pointer to the start of the attr name to the start
       // of the next attr
-      name_begin=name_end+1;
+      name_begin = name_end + 1;
       name_end++;
     }
 
+  free(attrvalbuf);
   free(listbuf);
+  
   return 0;
 }
 #endif
 
-void
-_create_path(const char *dir, const char *file, const char *pattern, char path[PATH_MAX])
+static
+int
+_create_real_path(const char *dir,
+                  const char *file,
+                  const char *pattern,
+                  char       *real_path,
+                  const int   maxlen)
 {
   int len;
 
-  while(*file == '/')
-    file++;
+  len = snprintf(real_path, maxlen, pattern, dir, file);
 
-  len = snprintf(path, PATH_MAX, "%s/%s", dir, file);
-
-  while(path[len] == '/')
-    path[len--] = '\0';
+  return len;
 }
 
-void
-create_path(const char *dir, const char *file, char path[PATH_MAX])
+int
+create_real_path(const char *dir,
+                 const char *file,
+                 char       *real_path,
+                 const int   maxlen)
 {
-  _create_path(dir, file, "%s/%s", path);
+  return _create_real_path(dir, file, "%s/%s", real_path, maxlen);
 }
 
-void
-create_tmppath(const char *dir, const char *file, char path[PATH_MAX])
+int
+create_real_tmppath(const char *dir,
+                    const char *file,
+                    char       *real_path,
+                    const int   maxlen)
 {
-  _create_path(dir, file, "%s/%s_XXXXXX", path);
+  return _create_real_path(dir, file, "%s/%s_XXXXXX", real_path, maxlen);
 }
 
-char *
-find_fullpath(const char *file, char path[PATH_MAX])
+char*
+find_real_path(const char *fuse_path,
+               char       *real_path,
+               const int   maxlen)
 {
   int i;
   struct stat st;
 
   for(i = 0; i < mhdd.dir_count; i++)
     {
-      create_path(mhdd.dirs[i], file, path);
-      if(lstat(path, &st) == 0) 
-        return path;
+      create_real_path(mhdd.dirs[i], fuse_path, real_path, maxlen);
+      if(lstat(real_path, &st) == 0) 
+        return real_path;
     }
   
   return NULL;
 }
 
 int
-find_fullpath_id(const char *file)
+find_real_path_id(const char *fuse_path)
 {
   int i;
   struct stat st;
-  char path[PATH_MAX];
+  char real_path[PATH_MAX];
 
   for(i = 0; i < mhdd.dir_count; i++)
     {
-      create_path(mhdd.dirs[i], file, path);
-      if(lstat(path, &st) == 0)
+      create_real_path(mhdd.dirs[i], fuse_path, real_path, PATH_MAX);
+      if(lstat(real_path, &st) == 0)
         return i;
     }
 
@@ -501,113 +554,103 @@ find_fullpath_id(const char *file)
 }
 
 int
-create_parent_dirs(int dir_id, const char *path)
+create_parent_dirs(int         dir_id,
+                   const char *fuse_path)
 {
-  char *parent;
+  int rv;
   struct stat st;  
-  char fullpath[PATH_MAX];
-  char parent_path[PATH_MAX];  
+  char real_path[PATH_MAX];
+  char parent_path[PATH_MAX];
+  char fuse_parent_path[PATH_MAX];
   
   mhdd_debug(MHDD_DEBUG,
-             "create_parent_dirs: dir_id=%d, path=%s\n", dir_id, path);
+             "create_parent_dirs: dir_id=%d, path=%s\n",
+             dir_id, fuse_path);
 
-  parent = get_parent_path(path);
-  if(!parent)
-    return 0;
+  if(dirname(fuse_path,fuse_parent_path,PATH_MAX) == NULL)
+    return (errno = EFAULT,-1);
 
-  if(find_fullpath(parent,fullpath) == NULL)
-    {
-      free(parent);
-      errno=EFAULT;
-      return -errno;
-    }
+  if(find_real_path(fuse_parent_path,real_path,PATH_MAX) == NULL)
+    return (errno = EFAULT,-1);
 
-  create_path(mhdd.dirs[dir_id], parent, parent_path);
+  create_real_path(mhdd.dirs[dir_id],fuse_parent_path,parent_path,PATH_MAX);
 
   // already exists
-  if(stat(parent_path, &st)==0)
-    {
-      free(parent);
-      return 0;
-    }
+  if(stat(parent_path, &st) == 0)
+    return 0;
 
   // create parent dirs
-  int res = create_parent_dirs(dir_id, parent);
-
-  if(res != 0)
-    {
-      free(parent);
-      return res;
-    }
+  rv = create_parent_dirs(dir_id, parent_path);
+  if(rv != 0)
+    return rv;
 
   // get stat from exists dir
-  if(stat(fullpath, &st) != 0)
-    {
-      free(parent);
-      return -errno;
-    }
+  if(stat(real_path, &st) != 0)
+    return -1;
 
-  res = mkdir(parent_path, st.st_mode);
-  if(res == 0)
+  rv = mkdir(parent_path, st.st_mode);
+  if(rv != 0)
     {
-      chown(parent_path, st.st_uid, st.st_gid);
-      chmod(parent_path, st.st_mode);
-    }
-  else
-    {
-      res = -errno;
       mhdd_debug(MHDD_DEBUG,
                  "create_parent_dirs: can not create dir %s: %s\n",
                  parent_path,
                  strerror(errno));
+      return -1;
     }
+  
+  chown(parent_path, st.st_uid, st.st_gid);
+  chmod(parent_path, st.st_mode);
 
 #ifndef WITHOUT_XATTR
-  // copy extended attributes of parent dir
-  if(copy_xattrs(fullpath, parent_path) == -1)
-    mhdd_debug(MHDD_MSG,
-               "copy_xattrs: error copying xattrs from %s to %s\n",
-               fullpath, parent_path);
+  copy_xattrs(real_path, parent_path);
 #endif
 
-  free(parent);
-
-  return res;
+  return 0;
 }
 
-char *
-get_parent_path(const char * path)
+static char*
+_dirname(const char *start,
+         char       *end)
 {
-  int len;
-  char *dir;
+  end--;
+  start++;
 
-  len = strlen(path);
-  dir = strdup(path);
-  
-  if(len && dir[len-1] == '/')
-    dir[--len] = 0;
+  while(end > start && *end == '/')
+    end--;
 
-  while(len && dir[len-1] != '/')
-    dir[--len] = 0;
+  while(end > start && *end != '/')
+    end--;
 
-  if(len > 1 && dir[len-1] == '/')
-    dir[--len] = 0;
+  while(end > start && *end == '/')
+    end--;
 
-  if(len)
-    return dir;
+  end[1] = '\0';
 
-  free(dir);
+  return &end[1];
+}  
 
-  return NULL;
+char*
+dirname(char const * const  path,
+        char               *parent,
+        size_t              maxlen)
+{
+  char *end;
+
+  end = memccpy(parent,path,'\0',maxlen);
+  if(end == NULL)
+    return NULL;
+
+  return _dirname(parent, &end[-1]);
 }
 
 /* return true if directory is empty */
 int
 dir_is_empty(const char *path)
 {
-  DIR * dir = opendir(path);
+  DIR *dir;
   struct dirent *de;
 
+  dir = opendir(path);
   if(!dir)
     return -1;
 
@@ -621,9 +664,135 @@ dir_is_empty(const char *path)
         continue;
 
       closedir(dir);
+
       return 0;
     }
 
   closedir(dir);
+
   return 1;
+}
+
+void
+normalize_statvfs(struct statvfs *stat,
+                  const unsigned long min_bsize,
+                  const unsigned long min_frsize,
+                  const unsigned long namemax)
+{
+  if(stat->f_bsize > min_bsize)
+    {
+      stat->f_bfree  *=  stat->f_bsize / min_bsize;
+      stat->f_bavail *=  stat->f_bsize / min_bsize;
+      stat->f_bsize   =  min_bsize;
+    }
+
+  if(stat->f_frsize > min_frsize)
+    {
+      stat->f_blocks *= stat->f_frsize / min_frsize;
+      stat->f_frsize  = min_frsize;
+    }
+
+  if(stat->f_namemax > namemax)
+    stat->f_namemax = namemax;
+}
+
+void
+merge_statvfs(struct statvfs       * const out,
+              const struct statvfs * const in)
+{
+  out->f_ffree  += in->f_ffree;
+  out->f_files  += in->f_files;
+  out->f_favail += in->f_favail;
+  out->f_bavail += in->f_bavail;
+  out->f_bfree  += in->f_bfree;
+  out->f_blocks += in->f_blocks;
+}
+
+int
+myfallocate(int   fd,
+            int   mode,
+            off_t offset,
+            off_t len)
+{
+  int rv;
+
+#ifdef _GNU_SOURCE
+  rv = fallocate(fd,mode,offset,len);
+#elif defined _XOPEN_SOURCE >= 600 || _POSIX_C_SOURCE >= 200112L
+  if(mode)
+    {
+      errno = EOPNOTSUPP;
+      rv = -1;
+    }
+  else
+    {
+      rv = posix_fallocate(fd,offset,len);
+    }
+#else
+  errno = EOPNOTSUPP;
+  rv = -1;
+#endif
+
+  return rv;
+}
+
+int
+has_cap_linux_immutable(const pid_t pid)
+{
+  int rv;
+  cap_t caps;
+  cap_flag_value_t cap_flag_value;
+  
+  caps = cap_get_pid(pid);
+  if(caps == NULL)
+    return -1;
+  
+  rv = cap_get_flag(caps,CAP_LINUX_IMMUTABLE,CAP_EFFECTIVE,&cap_flag_value);
+  if(rv == -1)
+    return -1;
+  
+  return (cap_flag_value == CAP_SET);
+}
+
+int
+ioctl_setflags(const int   fd,
+               const pid_t pid,
+               void       *data)
+{
+  int rv;
+  int flags;
+
+  rv = ioctl(fd,FS_IOC_GETFLAGS,&flags);
+  if(rv == -1)
+    return -1;
+
+  if(((*(int*)data) ^ flags) & FS_IMMUTABLE_FL)
+    {
+      rv = has_cap_linux_immutable(pid);
+      switch(rv)
+        {
+        case -1:
+          return -1;
+        case 0:
+          errno = EPERM;
+          return -1;
+        default:
+          break;
+        }
+    }
+
+  return ioctl(fd,FS_IOC_SETFLAGS,data);
+}
+               
+void
+mhdd_asserts()
+{
+  char parent[PATH_MAX];
+  const char const dir[] = "/check/dirname/foo///bar///";
+  
+  assert(dirname(dir,parent,PATH_MAX) != NULL);
+  assert(strcmp("/check/dirname/foo",parent) == 0);
+
+  assert(create_real_path("/a/b/c","d",parent,PATH_MAX) == 8);
+  assert(strcmp("/a/b/c/d",parent) == 0);
 }
